@@ -1,0 +1,36 @@
+[package]
+name = "pmux"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "1.0"
+dirs = "5.0"
+rfd = "0.14"
+regex = "1.10"
+uuid = { version = "1.6", features = ["v4"] }
+tokio = { version = "1.35", features = ["process", "rt-multi-thread"] }
+# GPUI dependencies (pinned to known working commit)
+gpui = { git = "https://github.com/zed-industries/zed", rev = "269b03f4" }
+gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "269b03f4", features = ["font-kit"] }
+anyhow = "1.0"
+alacritty_terminal = "0.25.1"
+
+[dev-dependencies]
+tempfile = "3.8"
+
+[[bin]]
+name = "pmux"
+path = "src/main.rs"
+
+[package.metadata.bundle]
+name = "pmux"
+identifier = "cn.mx5.pmux"
+icon = ["resources/pmux.icns"]
+version = "0.1.0"
+copyright = "Copyright (c) 2025"
+category = "Developer Tool"
+short_description = "AI Agent multi-branch development workbench"
+long_description = """A native desktop GUI application for managing multiple AI agents working in parallel with real-time monitoring and notifications."""

@@ -1,0 +1,365 @@
+// ui/notification_panel.rs - Notification panel component with GPUI render
+use gpui::prelude::*;
+use gpui::*;
+use std::sync::Arc;
+use crate::notification::{Notification, NotificationType};
+use std::time::Instant;
+
+/// Notification item for rendering
+#[derive(Clone)]
+pub struct NotificationItem {
+    pub id: String,
+    pub pane_id: String,
+    pub notif_type: NotificationType,
+    pub message: String,
+    pub timestamp: Instant,
+    pub read: bool,
+}
+
+impl NotificationItem {
+    pub fn from_notification(notif: &Notification, index: usize) -> Self {
+        Self {
+            id: format!("notif-{}", index),
+            pane_id: notif.pane_id().to_string(),
+            notif_type: notif.notif_type(),
+            message: notif.display_message(),
+            timestamp: notif.timestamp(),
+            read: notif.is_read(),
+        }
+    }
+
+    pub fn icon(&self) -> &'static str {
+        match self.notif_type {
+            NotificationType::Error => "✕",
+            NotificationType::Waiting => "◐",
+            NotificationType::Info => "ℹ",
+        }
+    }
+
+    pub fn color(&self) -> Rgba {
+        match self.notif_type {
+            NotificationType::Error => rgb(0xff4444),
+            NotificationType::Waiting => rgb(0xffaa00),
+            NotificationType::Info => rgb(0x4488ff),
+        }
+    }
+
+    pub fn formatted_time(&self) -> String {
+        let elapsed = self.timestamp.elapsed();
+        if elapsed.as_secs() < 60 {
+            "just now".to_string()
+        } else if elapsed.as_secs() < 3600 {
+            format!("{} min ago", elapsed.as_secs() / 60)
+        } else if elapsed.as_secs() < 86400 {
+            format!("{} hours ago", elapsed.as_secs() / 3600)
+        } else {
+            format!("{} days ago", elapsed.as_secs() / 86400)
+        }
+    }
+}
+
+/// NotificationPanel component - shows notifications in a popup panel
+pub struct NotificationPanel {
+    notifications: Vec<NotificationItem>,
+    is_visible: bool,
+    on_close: Arc<dyn Fn(&mut Window, &mut App)>,
+    on_mark_read: Arc<dyn Fn(usize, &mut Window, &mut App)>,
+    on_clear_all: Arc<dyn Fn(&mut Window, &mut App)>,
+    on_jump_to_pane: Arc<dyn Fn(&str, &mut Window, &mut App)>,
+}
+
+impl NotificationPanel {
+    pub fn new() -> Self {
+        Self {
+            notifications: Vec::new(),
+            is_visible: false,
+            on_close: Arc::new(|_, _| {}),
+            on_mark_read: Arc::new(|_, _, _| {}),
+            on_clear_all: Arc::new(|_, _| {}),
+            on_jump_to_pane: Arc::new(|_, _, _| {}),
+        }
+    }
+
+    pub fn with_notifications(mut self, notifications: Vec<NotificationItem>) -> Self {
+        self.notifications = notifications;
+        self
+    }
+
+    pub fn update_notifications(&mut self, notifications: Vec<NotificationItem>) {
+        self.notifications = notifications;
+    }
+
+    pub fn show(&mut self) { self.is_visible = true; }
+    pub fn hide(&mut self) { self.is_visible = false; }
+    pub fn toggle(&mut self) { self.is_visible = !self.is_visible; }
+    pub fn is_visible(&self) -> bool { self.is_visible }
+
+    pub fn unread_count(&self) -> usize {
+        self.notifications.iter().filter(|n| !n.read).count()
+    }
+
+    pub fn on_close<F: Fn(&mut Window, &mut App) + 'static>(mut self, f: F) -> Self {
+        self.on_close = Arc::new(f); self
+    }
+    pub fn on_mark_read<F: Fn(usize, &mut Window, &mut App) + 'static>(mut self, f: F) -> Self {
+        self.on_mark_read = Arc::new(f); self
+    }
+    pub fn on_clear_all<F: Fn(&mut Window, &mut App) + 'static>(mut self, f: F) -> Self {
+        self.on_clear_all = Arc::new(f); self
+    }
+    pub fn on_jump_to_pane<F: Fn(&str, &mut Window, &mut App) + 'static>(mut self, f: F) -> Self {
+        self.on_jump_to_pane = Arc::new(f); self
+    }
+
+    fn render_notification(&self, item: &NotificationItem, index: usize) -> impl IntoElement {
+        let icon = item.icon();
+        let color = item.color();
+        let time = item.formatted_time();
+        let message = item.message.clone();
+        let pane_id = item.pane_id.clone();
+        let is_read = item.read;
+        let on_mark_read = self.on_mark_read.clone();
+        let on_jump = self.on_jump_to_pane.clone();
+
+        div()
+            .id(format!("notif-item-{}", index))
+            .w_full()
+            .px(px(12.))
+            .py(px(8.))
+            .border_b_1()
+            .border_color(rgb(0x3d3d3d))
+            .when(!is_read, |el: Stateful<Div>| el.bg(rgb(0x2a2520)))
+            .when(is_read, |el: Stateful<Div>| el.bg(rgb(0x252525)))
+            .hover(|s: StyleRefinement| s.bg(rgb(0x303030)))
+            .cursor_pointer()
+            .on_click(move |_, window, cx| { on_jump(&pane_id, window, cx); })
+            .child(
+                div()
+                    .flex().flex_row().items_start().gap(px(8.))
+                    .child(div().text_size(px(12.)).text_color(color).child(icon))
+                    .child(
+                        div()
+                            .flex_1().flex().flex_col().gap(px(2.))
+                            .child(
+                                div()
+                                    .text_size(px(12.))
+                                    .text_color(if is_read { rgb(0xaaaaaa) } else { rgb(0xffffff) })
+                                    .child(message)
+                            )
+                            .child(div().text_size(px(10.)).text_color(rgb(0x666666)).child(time))
+                    )
+                    .child(
+                        div()
+                            .id(format!("mark-read-{}", index))
+                            .when(!is_read, |el: Stateful<Div>| {
+                                el.px(px(4.))
+                                    .text_size(px(10.))
+                                    .text_color(rgb(0x666666))
+                                    .hover(|s: StyleRefinement| s.text_color(rgb(0xffffff)))
+                                    .cursor_pointer()
+                                    .on_click(move |_, window, cx| { on_mark_read(index, window, cx); })
+                                    .child("✓")
+                            })
+                    )
+            )
+    }
+
+    fn render_empty(&self) -> impl IntoElement {
+        div()
+            .w_full().h(px(120.)).flex().flex_col().items_center().justify_center().gap(px(8.))
+            .child(div().text_size(px(24.)).text_color(rgb(0x555555)).child("🔕"))
+            .child(div().text_size(px(13.)).text_color(rgb(0x888888)).child("No notifications yet"))
+            .child(div().text_size(px(11.)).text_color(rgb(0x666666)).child("Desktop notifications will appear here."))
+    }
+}
+
+impl IntoElement for NotificationPanel {
+    type Element = Component<Self>;
+    fn into_element(self) -> Self::Element { Component::new(self) }
+}
+
+impl RenderOnce for NotificationPanel {
+    fn render(self, _window: &mut Window, _cx: &mut App) -> impl IntoElement {
+        if !self.is_visible {
+            return div().into_any_element();
+        }
+
+        let has_notifications = !self.notifications.is_empty();
+        let unread_count = self.unread_count();
+        let on_close = self.on_close.clone();
+        let on_clear_all = self.on_clear_all.clone();
+
+        div()
+            .id("notification-panel")
+            .absolute()
+            .top(px(40.))
+            .right(px(8.))
+            .w(px(320.))
+            .max_h(px(400.))
+            .bg(rgb(0x252525))
+            .rounded(px(6.))
+            .shadow_lg()
+            .border_1()
+            .border_color(rgb(0x3d3d3d))
+            .flex()
+            .flex_col()
+            .child(
+                div()
+                    .w_full().flex().flex_row().items_center().justify_between()
+                    .px(px(12.)).py(px(8.)).border_b_1().border_color(rgb(0x3d3d3d))
+                    .child(
+                        div()
+                            .flex().flex_row().items_center().gap(px(6.))
+                            .child(
+                                div()
+                                    .text_size(px(13.)).font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(rgb(0xffffff)).child("Notifications")
+                            )
+                            .when(unread_count > 0, |el: Div| {
+                                el.child(
+                                    div()
+                                        .px(px(5.)).py(px(1.)).rounded(px(10.)).bg(rgb(0xff4444))
+                                        .text_size(px(10.)).font_weight(FontWeight::BOLD)
+                                        .text_color(rgb(0xffffff)).child(format!("{}", unread_count))
+                                )
+                            })
+                    )
+                    .child(
+                        div()
+                            .flex().flex_row().items_center().gap(px(8.))
+                            .when(has_notifications, |el: Div| {
+                                el.child(
+                                    div()
+                                        .id("clear-all-btn")
+                                        .text_size(px(11.)).text_color(rgb(0x888888))
+                                        .hover(|s: StyleRefinement| s.text_color(rgb(0xffffff)))
+                                        .cursor_pointer()
+                                        .on_click(move |_, window, cx| { on_clear_all(window, cx); })
+                                        .child("Clear")
+                                )
+                            })
+                            .child(
+                                div()
+                                    .id("close-panel-btn")
+                                    .text_size(px(14.)).text_color(rgb(0x888888))
+                                    .hover(|s: StyleRefinement| s.text_color(rgb(0xffffff)))
+                                    .cursor_pointer()
+                                    .on_click(move |_, window, cx| { on_close(window, cx); })
+                                    .child("×")
+                            )
+                    )
+            )
+            .child(
+                if has_notifications {
+                    div()
+                        .id("notif-list")
+                        .flex_1()
+                        .overflow_y_scroll()
+                        .children(
+                            self.notifications
+                                .iter()
+                                .enumerate()
+                                .map(|(i, item)| self.render_notification(item, i).into_any_element())
+                                .collect::<Vec<_>>()
+                        )
+                        .into_any_element()
+                } else {
+                    self.render_empty().into_any_element()
+                }
+            )
+            .into_any_element()
+    }
+}
+
+impl Default for NotificationPanel {
+    fn default() -> Self { Self::new() }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::notification::Notification;
+
+    #[test]
+    fn test_notification_item_creation() {
+        let notif = Notification::new("pane-1", NotificationType::Error, "Test error");
+        let item = NotificationItem::from_notification(&notif, 0);
+        assert_eq!(item.id, "notif-0");
+        assert_eq!(item.pane_id, "pane-1");
+        assert!(!item.read);
+    }
+
+    #[test]
+    fn test_icon_mapping() {
+        let error_item = NotificationItem {
+            id: "1".to_string(), pane_id: "p1".to_string(),
+            notif_type: NotificationType::Error, message: "err".to_string(),
+            timestamp: Instant::now(), read: false,
+        };
+        assert_eq!(error_item.icon(), "✕");
+
+        let info_item = NotificationItem {
+            id: "2".to_string(), pane_id: "p2".to_string(),
+            notif_type: NotificationType::Info, message: "ok".to_string(),
+            timestamp: Instant::now(), read: false,
+        };
+        assert_eq!(info_item.icon(), "ℹ");
+    }
+
+    #[test]
+    fn test_color_mapping() {
+        let error_item = NotificationItem {
+            id: "1".to_string(), pane_id: "p1".to_string(),
+            notif_type: NotificationType::Error, message: "err".to_string(),
+            timestamp: Instant::now(), read: false,
+        };
+        let _ = error_item.color();
+    }
+
+    #[test]
+    fn test_timestamp_formatting() {
+        let item = NotificationItem {
+            id: "1".to_string(), pane_id: "p1".to_string(),
+            notif_type: NotificationType::Info, message: "msg".to_string(),
+            timestamp: Instant::now(), read: false,
+        };
+        assert_eq!(item.formatted_time(), "just now");
+    }
+
+    #[test]
+    fn test_panel_creation() {
+        let panel = NotificationPanel::new();
+        assert!(!panel.is_visible());
+        assert_eq!(panel.unread_count(), 0);
+    }
+
+    #[test]
+    fn test_visibility_toggle() {
+        let mut panel = NotificationPanel::new();
+        panel.show(); assert!(panel.is_visible());
+        panel.hide(); assert!(!panel.is_visible());
+        panel.toggle(); assert!(panel.is_visible());
+        panel.toggle(); assert!(!panel.is_visible());
+    }
+
+    #[test]
+    fn test_unread_count() {
+        let items = vec![
+            NotificationItem { id: "1".to_string(), pane_id: "p1".to_string(), notif_type: NotificationType::Error, message: "err".to_string(), timestamp: Instant::now(), read: false },
+            NotificationItem { id: "2".to_string(), pane_id: "p2".to_string(), notif_type: NotificationType::Info, message: "info".to_string(), timestamp: Instant::now(), read: true },
+            NotificationItem { id: "3".to_string(), pane_id: "p3".to_string(), notif_type: NotificationType::Waiting, message: "wait".to_string(), timestamp: Instant::now(), read: false },
+        ];
+        let panel = NotificationPanel::new().with_notifications(items);
+        assert_eq!(panel.unread_count(), 2);
+    }
+
+    #[test]
+    fn test_callback_registration() {
+        let panel = NotificationPanel::new()
+            .on_close(|_, _| {})
+            .on_mark_read(|_, _, _| {})
+            .on_clear_all(|_, _| {})
+            .on_jump_to_pane(|_, _, _| {});
+        assert!(!panel.is_visible());
+    }
+}

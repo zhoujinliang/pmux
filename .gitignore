@@ -1,0 +1,29 @@
+# Rust / Cargo
+/target/
+**/*.rs.bk
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+*.swp
+*~
+
+# IDE / Editor
+.idea/
+.vscode/
+*.sublime-project
+*.sublime-workspace
+
+# Debug / Profiling
+*.pdb
+*.profraw
+*.profdata
+
+# Local config (user-specific)
+config.json
+
+# Build artifacts
+*.dSYM/
+*.dylib
+*.so
+*.dll
