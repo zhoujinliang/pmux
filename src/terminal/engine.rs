@@ -61,9 +61,14 @@ impl TerminalEngine {
 
     /// Process all pending bytes from the PTY channel.
     /// Drains byte_rx with try_recv() until empty, advancing each chunk through the VTE processor.
+    /// Uses try_lock() to avoid blocking the render thread - if terminal is locked, skips this cycle.
     pub fn advance_bytes(&self) {
-        let mut term = self.terminal.lock().unwrap();
-        let mut processor = self.processor.lock().unwrap();
+        let Ok(mut term) = self.terminal.try_lock() else {
+            return; // Terminal locked by render thread, skip this cycle
+        };
+        let Ok(mut processor) = self.processor.try_lock() else {
+            return; // Processor locked, skip this cycle
+        };
         while let Ok(bytes) = self.byte_rx.try_recv() {
             processor.advance(&mut *term, &bytes);
         }
@@ -127,7 +132,8 @@ impl TerminalEngine {
 
     /// Get renderable content for frame loop rendering.
     /// Calls `f` with (content, display_iter, screen_lines). Use the iterator for cells; content provides colors and cursor.
-    pub fn with_renderable_content<F, R>(&self, f: F) -> R
+    /// Uses try_lock() to avoid blocking - returns None if terminal is busy.
+    pub fn try_renderable_content<F, R>(&self, f: F) -> Option<R>
     where
         F: FnOnce(
             &alacritty_terminal::term::RenderableContent<'_>,
@@ -135,16 +141,24 @@ impl TerminalEngine {
             usize,
         ) -> R,
     {
-        let term = self.terminal.lock().unwrap();
+        let Ok(term) = self.terminal.try_lock() else {
+            return None; // Terminal locked by advance_bytes thread
+        };
+
         let content = term.renderable_content();
+
         let display_iter = term.grid().display_iter();
         let screen_lines = term.grid().screen_lines();
-        f(&content, display_iter, screen_lines)
+        Some(f(&content, display_iter, screen_lines))
     }
 
     /// Returns true when a TUI app (vim, neovim, Claude Code, etc.) is active.
+    /// Uses try_lock to avoid deadlock when called from rendering context.
     pub fn is_tui_active(&self) -> bool {
-        let term = self.terminal.lock().unwrap();
+        let Ok(term) = self.terminal.try_lock() else {
+            // If we can't get the lock (rendering is in progress), assume no TUI
+            return false;
+        };
         term.mode().contains(TermMode::ALT_SCREEN)
     }
 

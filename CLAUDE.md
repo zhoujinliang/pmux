@@ -96,6 +96,9 @@ The project uses openspec for feature specifications:
 ### Subagent-Driven Development
 When implementing plans from `docs/plans/` (Runtime Phase 1–4), use the `subagent-driven-development` skill to delegate tasks to subagents (explore/shell/generalPurpose) for parallel execution. See `.cursor/skills/subagent-driven-development/SKILL.md`.
 
+### Writing Plans
+When creating implementation plans from specs or approved designs, use the `writing-plans` skill. Plans go to `docs/plans/YYYY-MM-DD-<feature>.md` with bite-sized tasks, exact file paths, and complete code samples. See `.cursor/skills/writing-plans/SKILL.md`.
+
 ### Code Review
 When the user requests a code review, use the `requesting-code-review` skill. Review against design.md, success criteria, and pmux conventions. See `.cursor/skills/requesting-code-review/SKILL.md`.
 

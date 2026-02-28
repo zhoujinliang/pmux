@@ -29,6 +29,7 @@ impl WorktreeItem {
         match self.status {
             AgentStatus::Running => "●",
             AgentStatus::Waiting => "◐",
+            AgentStatus::WaitingConfirm => "▲",
             AgentStatus::Idle => "○",
             AgentStatus::Error => "✕",
             AgentStatus::Exited => "✓",
@@ -40,6 +41,7 @@ impl WorktreeItem {
         match self.status {
             AgentStatus::Running => rgb(0x4caf50),
             AgentStatus::Waiting => rgb(0xffc107),
+            AgentStatus::WaitingConfirm => rgb(0xff9800),
             AgentStatus::Idle => rgb(0x9e9e9e),
             AgentStatus::Error => rgb(0xf44336),
             AgentStatus::Exited => rgb(0x2196f3),
@@ -60,6 +62,7 @@ impl WorktreeItem {
         match self.status {
             AgentStatus::Running => "Running",
             AgentStatus::Waiting => "Waiting for input",
+            AgentStatus::WaitingConfirm => "Waiting for confirmation",
             AgentStatus::Idle => "Idle",
             AgentStatus::Error => "Error detected",
             AgentStatus::Exited => "Process exited",

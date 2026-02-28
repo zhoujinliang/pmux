@@ -77,9 +77,13 @@ Desktop.ini
 test-output/
 test-results/
 *.test-results
+tests/results/
 
 # Temporary files
 tmp/
 temp/
 *.tmp
 *.temp
+
+# Git worktrees (using-git-worktrees skill)
+.worktrees/

@@ -27,6 +27,9 @@ pub struct WorktreeState {
     pub backend: String,
     pub backend_session_id: String,
     pub backend_window_id: String,
+    /// JSON-serialized SplitNode for multi-pane layout recovery
+    #[serde(default)]
+    pub split_tree_json: Option<String>,
 }
 
 /// Workspace with multiple worktrees
@@ -123,6 +126,7 @@ mod tests {
                 backend: "tmux".to_string(),
                 backend_session_id: "pmux-repo".to_string(),
                 backend_window_id: "@0".to_string(),
+                split_tree_json: None,
             },
         );
         assert_eq!(state.workspaces.len(), 1);
@@ -143,6 +147,7 @@ mod tests {
                 backend: "tmux".to_string(),
                 backend_session_id: "pmux-repo".to_string(),
                 backend_window_id: "@0".to_string(),
+                split_tree_json: None,
             },
         );
         state.upsert_worktree(
@@ -155,6 +160,7 @@ mod tests {
                 backend: "tmux".to_string(),
                 backend_session_id: "pmux-repo".to_string(),
                 backend_window_id: "@0".to_string(),
+                split_tree_json: None,
             },
         );
         assert_eq!(state.workspaces[0].worktrees[0].pane_ids.len(), 2);
@@ -173,6 +179,7 @@ mod tests {
                 backend: "tmux".to_string(),
                 backend_session_id: "s".to_string(),
                 backend_window_id: "@0".to_string(),
+                split_tree_json: None,
             },
         );
         let ws = state.find_workspace(&PathBuf::from("/repo"));

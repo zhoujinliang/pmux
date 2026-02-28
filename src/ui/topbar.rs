@@ -77,8 +77,9 @@ impl TopBar {
     }
 
     fn notification_count(&self) -> usize {
-        self.notification_count_override
-            .unwrap_or_else(|| self.status_counts.error + self.status_counts.waiting)
+        self.notification_count_override.unwrap_or_else(|| {
+            self.status_counts.error + self.status_counts.waiting + self.status_counts.waiting_confirm
+        })
     }
 
     fn render_workspace_tab(&self, tab: &WorkspaceTab, index: usize, is_active: bool) -> impl IntoElement {

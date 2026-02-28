@@ -10,6 +10,8 @@ pub enum NotificationType {
     Error,
     /// Waiting for user input
     Waiting,
+    /// Waiting for confirmation/approval (e.g. permission request)
+    WaitingConfirm,
     /// General information
     Info,
 }
@@ -20,6 +22,7 @@ impl NotificationType {
         match self {
             NotificationType::Error => 3,
             NotificationType::Waiting => 2,
+            NotificationType::WaitingConfirm => 2,
             NotificationType::Info => 1,
         }
     }
@@ -29,6 +32,7 @@ impl NotificationType {
         match self {
             NotificationType::Error => "Error",
             NotificationType::Waiting => "Waiting",
+            NotificationType::WaitingConfirm => "Confirm",
             NotificationType::Info => "Info",
         }
     }
@@ -38,6 +42,7 @@ impl NotificationType {
         match self {
             NotificationType::Error => "✕",
             NotificationType::Waiting => "◐",
+            NotificationType::WaitingConfirm => "▲",
             NotificationType::Info => "ℹ",
         }
     }
@@ -152,6 +157,7 @@ pub struct NotificationSummary {
     pub unread: usize,
     pub error_count: usize,
     pub waiting_count: usize,
+    pub waiting_confirm_count: usize,
     pub info_count: usize,
 }
 
@@ -176,9 +182,9 @@ impl NotificationSummary {
         self.error_count > 0
     }
 
-    /// Check if there are waiting notifications
+    /// Check if there are waiting notifications (input or confirmation)
     pub fn has_waiting(&self) -> bool {
-        self.waiting_count > 0
+        self.waiting_count > 0 || self.waiting_confirm_count > 0
     }
 }
 

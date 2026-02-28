@@ -9,7 +9,7 @@ use crate::notification_manager::NotificationManager;
 use crate::system_notifier;
 use crate::terminal::TerminalEngine;
 use crate::runtime::{AgentRuntime, EventBus, RuntimeEvent, StatusPublisher};
-use crate::runtime::backends::{create_runtime_from_env, main_window_target};
+use crate::runtime::backends::{create_runtime_from_env, recover_runtime, resolve_backend, window_name_for_worktree, window_target};
 use crate::runtime::{RuntimeState, WorktreeState};
 use crate::ui::{AppState, sidebar::Sidebar, workspace_tabbar::WorkspaceTabBar, terminal_view::TerminalBuffer, notification_panel::{NotificationPanel, NotificationItem}, new_branch_dialog_ui::NewBranchDialogUi, delete_worktree_dialog_ui::DeleteWorktreeDialogUi, split_pane_container::SplitPaneContainer, diff_overlay::DiffOverlay, status_bar::StatusBar};
 use crate::split_tree::SplitNode;
@@ -219,6 +219,7 @@ impl AppRoot {
         // Attach to active tab (full polling, input)
         let repo_name = self.workspace_manager.active_tab().map(|t| t.name.clone());
         let repo_path = self.workspace_manager.active_tab().map(|t| t.path.clone());
+
         if let (Some(name), Some(path)) = (repo_name, repo_path) {
             // Restore per-repo worktree selection if saved
             let restored_idx = self.per_repo_worktree_index.get(&path).copied();
@@ -264,6 +265,7 @@ impl AppRoot {
 
     fn setup_local_terminal(&mut self, runtime: Arc<dyn AgentRuntime>, pane_target: &str, cx: &mut Context<Self>) {
         let (cols, rows) = runtime.get_pane_dimensions(&pane_target.to_string());
+
         let cache_size = Config::load().unwrap_or_default().terminal_row_cache_size();
 
         if let Some(rx) = runtime.subscribe_output(&pane_target.to_string()) {
@@ -281,6 +283,7 @@ impl AppRoot {
             let _entity = cx.entity();
             cx.spawn(async move |entity, cx| {
                 loop {
+                    // Use 16ms for ~60fps input polling
                     blocking::unblock(|| std::thread::sleep(Duration::from_millis(16))).await;
 
                     // Process new terminal bytes
@@ -309,8 +312,9 @@ impl AppRoot {
                         if let Some(content_str) = content {
                             let _ = pub_.check_status(
                                 &pane_target_clone,
-                                &content_str,
+                                crate::status_detector::ProcessStatus::Running,
                                 Some(shell_info),
+                                &content_str,
                             );
                         }
                     }
@@ -333,46 +337,155 @@ impl AppRoot {
         }
     }
 
+    /// Set up terminal output stream for a single pane. Inserts into buffers without clearing.
+    /// Used when adding a new split pane or restoring multi-pane layout.
+    fn setup_pane_terminal_output(
+        &mut self,
+        runtime: Arc<dyn AgentRuntime>,
+        pane_target: &str,
+        cx: &mut Context<Self>,
+    ) {
+        let (cols, rows) = runtime.get_pane_dimensions(&pane_target.to_string());
+        let cache_size = Config::load().unwrap_or_default().terminal_row_cache_size();
+
+        if let Some(rx) = runtime.subscribe_output(&pane_target.to_string()) {
+            let engine = Arc::new(TerminalEngine::new(cols as usize, rows as usize, rx));
+            let buffer = TerminalBuffer::new_term_with_cache_size(engine.clone(), cache_size);
+            if let Ok(mut buffers) = self.terminal_buffers.lock() {
+                buffers.insert(pane_target.to_string(), buffer);
+            }
+
+            let status_publisher = self.status_publisher.clone();
+            let pane_target_clone = pane_target.to_string();
+            let _entity = cx.entity();
+            cx.spawn(async move |entity, cx| {
+                loop {
+                    blocking::unblock(|| std::thread::sleep(Duration::from_millis(16))).await;
+                    engine.advance_bytes();
+                    if let Some(ref pub_) = status_publisher {
+                        let shell_info = crate::shell_integration::ShellPhaseInfo {
+                            phase: engine.shell_phase(),
+                            last_post_exec_exit_code: engine.last_post_exec_exit_code(),
+                        };
+                        let content: Option<String> = entity
+                            .update(cx, |this, _cx| {
+                                if let Ok(buffers) = this.terminal_buffers.lock() {
+                                    if let Some(buffer) = buffers.get(&pane_target_clone) {
+                                        return buffer.content_for_status_detection();
+                                    }
+                                }
+                                None
+                            })
+                            .ok()
+                            .flatten();
+                        if let Some(content_str) = content {
+                            let _ = pub_.check_status(
+                                &pane_target_clone,
+                                crate::status_detector::ProcessStatus::Running,
+                                Some(shell_info),
+                                &content_str,
+                            );
+                        }
+                    }
+                    if entity.update(cx, |_, cx| cx.notify()).is_err() {
+                        break;
+                    }
+                }
+            })
+            .detach();
+        } else {
+            if let Ok(mut buffers) = self.terminal_buffers.lock() {
+                buffers.insert(
+                    pane_target.to_string(),
+                    TerminalBuffer::Error("Streaming unavailable.".to_string()),
+                );
+            }
+            cx.notify();
+        }
+    }
+
+    /// Attach an existing runtime: wire UI state, terminal, status publisher.
+    /// Used by start_local_session, switch_to_worktree, and try_recover_*.
+    /// When `saved_split_tree` is Some (multi-pane recovery), restores the full layout.
+    fn attach_runtime(
+        &mut self,
+        runtime: Arc<dyn AgentRuntime>,
+        pane_target: String,
+        worktree_path: &Path,
+        branch_name: &str,
+        cx: &mut Context<Self>,
+        saved_split_tree: Option<SplitNode>,
+    ) {
+        self.runtime = Some(runtime.clone());
+
+        let (split_tree, pane_targets): (SplitNode, Vec<String>) = match saved_split_tree {
+            Some(tree) if tree.pane_count() > 1 => {
+                let targets: Vec<String> = tree.flatten().into_iter().map(|(t, _)| t).collect();
+                (tree, targets)
+            }
+            _ => {
+                let _ = runtime.focus_pane(&pane_target);
+                (SplitNode::pane(&pane_target), vec![pane_target.clone()])
+            }
+        };
+
+        self.split_tree = split_tree;
+        self.active_pane_target = Some(pane_targets[0].clone());
+        self.focused_pane_index = 0;
+        if let Ok(mut guard) = self.active_pane_target_shared.lock() {
+            *guard = pane_targets[0].clone();
+        }
+        if let Ok(mut guard) = self.pane_targets_shared.lock() {
+            *guard = pane_targets.clone();
+        }
+        self.terminal_needs_focus = true;
+
+        self.ensure_event_bus_subscription(cx);
+
+        let status_publisher = StatusPublisher::new(Arc::clone(&self.event_bus));
+        for pt in &pane_targets {
+            status_publisher.register_pane(pt);
+        }
+        self.status_publisher = Some(status_publisher);
+
+        if pane_targets.len() == 1 {
+            self.setup_local_terminal(runtime, &pane_targets[0], cx);
+        } else {
+            if let Ok(mut buffers) = self.terminal_buffers.lock() {
+                buffers.clear();
+            }
+            for pt in &pane_targets {
+                self.setup_pane_terminal_output(runtime.clone(), pt, cx);
+            }
+        }
+
+        if let Some(tab) = self.workspace_manager.active_tab() {
+            let wp = tab.path.clone();
+            self.save_runtime_state(&wp, worktree_path, branch_name);
+        }
+    }
+
     /// Start local PTY session for the given repo
     /// Sets up terminal content polling, status polling, and input handling.
     /// Backend is selected via PMUX_BACKEND env var (local or tmux).
     fn start_local_session(&mut self, worktree_path: &Path, branch_name: &str, cx: &mut Context<Self>) {
-        let runtime = match create_runtime_from_env(worktree_path, 80, 24) {
+        let workspace_path = self
+            .workspace_manager
+            .active_tab()
+            .map(|t| t.path.clone())
+            .unwrap_or_else(|| worktree_path.to_path_buf());
+        let config = Config::load().ok();
+        let runtime = match create_runtime_from_env(&workspace_path, worktree_path, branch_name, 80, 24, config.as_ref()) {
             Ok(rt) => rt,
             Err(e) => {
                 self.state.error_message = Some(format!("Runtime error: {}", e));
                 return;
             }
         };
-        self.runtime = Some(runtime.clone());
-
-        let pane_target = runtime.primary_pane_id().unwrap_or_else(|| format!("local:{}", worktree_path.display()));
-        self.active_pane_target = Some(pane_target.clone());
-        self.split_tree = SplitNode::pane(&pane_target);
-        self.focused_pane_index = 0;
-        if let Ok(mut guard) = self.active_pane_target_shared.lock() {
-            *guard = pane_target.clone();
-        }
-        if let Ok(mut guard) = self.pane_targets_shared.lock() {
-            *guard = vec![pane_target.clone()];
-        }
-
-        self.terminal_needs_focus = true;
-
-        self.ensure_event_bus_subscription(cx);
-
-        // Initialize StatusPublisher (event-driven, no polling)
-        // Status is detected when terminal content changes, not on a timer
-        let status_publisher = StatusPublisher::new(Arc::clone(&self.event_bus));
-        status_publisher.register_pane(&pane_target);
-        self.status_publisher = Some(status_publisher);
-
-        self.setup_local_terminal(runtime, &pane_target, cx);
-
-        if let Some(tab) = self.workspace_manager.active_tab() {
-            let wp = tab.path.clone();
-            self.save_runtime_state(&wp, worktree_path, branch_name);
-        }
+        let pane_target = runtime
+            .primary_pane_id()
+            .unwrap_or_else(|| format!("local:{}", worktree_path.display()));
+        self.attach_runtime(runtime, pane_target, worktree_path, branch_name, cx, None);
     }
 
     /// Handle adding a new workspace
@@ -524,14 +637,119 @@ impl AppRoot {
         !self.workspace_manager.is_empty()
     }
 
+    fn effective_backend(&self) -> String {
+        std::env::var(crate::runtime::backends::PMUX_BACKEND_ENV)
+            .unwrap_or_else(|_| crate::runtime::backends::DEFAULT_BACKEND.to_string())
+    }
+
     /// Try recover from runtime_state. For local PTY, always returns false (no session recovery).
-    fn try_recover_then_switch(&mut self, _workspace_path: &Path, _worktree_path: &Path, _branch_name: &str, _cx: &mut Context<Self>) -> bool {
-        false
+    fn try_recover_then_switch(
+        &mut self,
+        workspace_path: &Path,
+        worktree_path: &Path,
+        branch_name: &str,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if self.effective_backend() != "tmux" {
+            return false;
+        }
+        let state = match RuntimeState::load() {
+            Ok(s) => s,
+            Err(_) => return false,
+        };
+        let workspace_path_buf = workspace_path.to_path_buf();
+        let workspace = match state.find_workspace(&workspace_path_buf) {
+            Some(w) => w,
+            None => return false,
+        };
+        let worktree = match workspace
+            .worktrees
+            .iter()
+            .find(|w| w.path.as_path() == worktree_path)
+        {
+            Some(w) => w,
+            None => return false,
+        };
+
+        let runtime = match recover_runtime(
+            &worktree.backend,
+            worktree,
+            Some(Arc::clone(&self.event_bus)),
+        ) {
+            Ok(rt) => rt,
+            Err(_) => return false,
+        };
+
+        let pane_target = worktree
+            .pane_ids
+            .first()
+            .cloned()
+            .or_else(|| runtime.primary_pane_id())
+            .unwrap_or_else(|| format!("local:{}", worktree_path.display()));
+
+        let saved_split_tree = worktree
+            .split_tree_json
+            .as_deref()
+            .and_then(|s| serde_json::from_str::<SplitNode>(s).ok());
+
+        self.attach_runtime(runtime, pane_target, worktree_path, branch_name, cx, saved_split_tree);
+        true
     }
 
     /// Try recover for repo-only (no worktrees). For local PTY, always returns false.
-    fn try_recover_then_start(&mut self, _workspace_path: &Path, _repo_name: &str, _cx: &mut Context<Self>) -> bool {
-        false
+    fn try_recover_then_start(
+        &mut self,
+        workspace_path: &Path,
+        _repo_name: &str,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if self.effective_backend() != "tmux" {
+            return false;
+        }
+        let state = match RuntimeState::load() {
+            Ok(s) => s,
+            Err(_) => return false,
+        };
+        let workspace_path_buf = workspace_path.to_path_buf();
+        let workspace = match state.find_workspace(&workspace_path_buf) {
+            Some(w) => w,
+            None => return false,
+        };
+        let worktree = match workspace.worktrees.first() {
+            Some(w) => w,
+            None => return false,
+        };
+
+        let runtime = match recover_runtime(
+            &worktree.backend,
+            worktree,
+            Some(Arc::clone(&self.event_bus)),
+        ) {
+            Ok(rt) => rt,
+            Err(_) => return false,
+        };
+
+        let pane_target = worktree
+            .pane_ids
+            .first()
+            .cloned()
+            .or_else(|| runtime.primary_pane_id())
+            .unwrap_or_else(|| format!("local:{}", worktree.path.display()));
+
+        let saved_split_tree = worktree
+            .split_tree_json
+            .as_deref()
+            .and_then(|s| serde_json::from_str::<SplitNode>(s).ok());
+
+        self.attach_runtime(
+            runtime,
+            pane_target,
+            &worktree.path,
+            &worktree.branch,
+            cx,
+            saved_split_tree,
+        );
+        true
     }
 
     fn ensure_event_bus_subscription(&mut self, cx: &mut Context<Self>) {
@@ -568,6 +786,9 @@ impl AppRoot {
                         let notif_type = match n.notif_type {
                             crate::runtime::NotificationType::Error => NotificationType::Error,
                             crate::runtime::NotificationType::WaitingInput => NotificationType::Waiting,
+                            crate::runtime::NotificationType::WaitingConfirm => {
+                                NotificationType::WaitingConfirm
+                            }
                             crate::runtime::NotificationType::Info => NotificationType::Info,
                         };
                         let message = n.message.clone();
@@ -623,6 +844,8 @@ impl AppRoot {
                 )
             });
 
+        let split_tree_json = serde_json::to_string(&self.split_tree).ok();
+
         let wt = WorktreeState {
             branch: branch_name.to_string(),
             path: worktree_path.to_path_buf(),
@@ -631,6 +854,7 @@ impl AppRoot {
             backend: backend.to_string(),
             backend_session_id,
             backend_window_id,
+            split_tree_json,
         };
         let mut state = RuntimeState::load().unwrap_or_default();
         state.upsert_worktree(workspace_path.to_path_buf(), wt);
@@ -642,42 +866,27 @@ impl AppRoot {
     fn switch_to_worktree(&mut self, worktree_path: &Path, branch_name: &str, cx: &mut Context<Self>) {
         self.stop_current_session();
 
-        let runtime = match create_runtime_from_env(worktree_path, 80, 24) {
+        let workspace_path = self
+            .workspace_manager
+            .active_tab()
+            .map(|t| t.path.clone())
+            .unwrap_or_else(|| worktree_path.to_path_buf());
+        let config = Config::load().ok();
+        let runtime = match create_runtime_from_env(&workspace_path, worktree_path, branch_name, 80, 24, config.as_ref()) {
             Ok(rt) => rt,
             Err(e) => {
-                self.state.error_message = Some(format!("Runtime error for worktree {}: {}", worktree_path.display(), e));
+                self.state.error_message = Some(format!(
+                    "Runtime error for worktree {}: {}",
+                    worktree_path.display(),
+                    e
+                ));
                 return;
             }
         };
-        self.runtime = Some(runtime.clone());
-
-        let pane_target = runtime.primary_pane_id().unwrap_or_else(|| format!("local:{}", worktree_path.display()));
-        let _ = runtime.focus_pane(&pane_target);
-        self.active_pane_target = Some(pane_target.clone());
-        self.split_tree = SplitNode::pane(&pane_target);
-        self.focused_pane_index = 0;
-        if let Ok(mut guard) = self.active_pane_target_shared.lock() {
-            *guard = pane_target.clone();
-        }
-        if let Ok(mut guard) = self.pane_targets_shared.lock() {
-            *guard = vec![pane_target.clone()];
-        }
-        self.terminal_needs_focus = true;
-
-        self.ensure_event_bus_subscription(cx);
-
-        let status_publisher = StatusPublisher::new(Arc::clone(&self.event_bus));
-        status_publisher.register_pane(&pane_target);
-        // StatusPublisher is event-driven - status checks are triggered by terminal output
-        // No need to start a polling thread; check_status() will be called when content changes
-        self.status_publisher = Some(status_publisher);
-
-        self.setup_local_terminal(runtime, &pane_target, cx);
-
-        if let Some(tab) = self.workspace_manager.active_tab() {
-            let wp = tab.path.clone();
-            self.save_runtime_state(&wp, worktree_path, branch_name);
-        }
+        let pane_target = runtime
+            .primary_pane_id()
+            .unwrap_or_else(|| format!("local:{}", worktree_path.display()));
+        self.attach_runtime(runtime, pane_target, worktree_path, branch_name, cx, None);
     }
 
     /// Process pending worktree selection (called from render context)
@@ -863,12 +1072,8 @@ impl AppRoot {
             new_target.clone(),
         ) {
             self.split_tree = new_tree;
-            if let Ok(mut buffers) = self.terminal_buffers.lock() {
-                let (cols, rows) = self.runtime.as_ref().map(|r| r.get_pane_dimensions(&new_target)).unwrap_or((80, 24));
-                buffers.insert(
-                    new_target.clone(),
-                    TerminalBuffer::new_empty_term(cols as usize, rows as usize),
-                );
+            if let Some(rt) = &self.runtime {
+                self.setup_pane_terminal_output(rt.clone(), &new_target, cx);
             }
             if let Ok(mut guard) = self.pane_targets_shared.lock() {
                 *guard = self.split_tree.flatten().into_iter().map(|(t, _)| t).collect();
@@ -876,8 +1081,28 @@ impl AppRoot {
             if let Some(ref mut pub_) = self.status_publisher {
                 pub_.register_pane(&new_target);
             }
+            self.save_current_worktree_runtime_state();
             cx.notify();
         }
+    }
+
+    /// Save runtime state for the current active worktree. No-op if no tab or worktree.
+    fn save_current_worktree_runtime_state(&mut self) {
+        let (workspace_path, worktree_path, branch_name) = {
+            let Some(tab) = self.workspace_manager.active_tab() else { return };
+            let Some(awi) = self.active_worktree_index else { return };
+            let worktrees = match crate::worktree::discover_worktrees(&tab.path) {
+                Ok(w) => w,
+                Err(_) => return,
+            };
+            let Some(wt) = worktrees.get(awi) else { return };
+            (
+                tab.path.clone(),
+                wt.path.clone(),
+                wt.short_branch_name().to_string(),
+            )
+        };
+        self.save_runtime_state(&workspace_path, &worktree_path, &branch_name);
     }
 
     /// Opens diff view for the given worktree index (or current if None)
@@ -1116,7 +1341,8 @@ impl AppRoot {
         let worktree_path = worktree.path.clone();
         let branch = worktree.short_branch_name().to_string();
 
-        let target = main_window_target(&worktree.path);
+        let win_name = window_name_for_worktree(&worktree.path, &branch);
+        let target = window_target(&repo_path, &win_name);
         if let Some(rt) = &self.runtime {
             if let Err(e) = rt.kill_window(&target) {
                 eprintln!("tmux kill-window failed (best-effort): {}", e);
@@ -1642,12 +1868,16 @@ impl AppRoot {
                         let idx = self.active_worktree_index?;
                         wts.get(idx).map(|w| w.short_branch_name().to_string())
                     });
-                StatusBar::from_context(
-                    worktree_branch.as_deref(),
-                    self.split_tree.pane_count(),
-                    self.focused_pane_index,
-                    &self.status_counts,
-                )
+                {
+                    let backend = resolve_backend(Config::load().ok().as_ref());
+                    StatusBar::from_context(
+                        worktree_branch.as_deref(),
+                        self.split_tree.pane_count(),
+                        self.focused_pane_index,
+                        &self.status_counts,
+                        Some(backend.as_str()),
+                    )
+                }
             })
             .when(show_notifications, |el: Stateful<Div>| {
                 let notification_items: Vec<NotificationItem> = self

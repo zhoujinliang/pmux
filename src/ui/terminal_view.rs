@@ -72,13 +72,16 @@ impl TerminalBuffer {
     }
 
     /// Extract text for status detection. Source: stream (Term) only—never capture-pane.
+    /// Uses try_renderable_content to avoid blocking.
     pub fn content_for_status_detection(&self) -> Option<String> {
         match self {
-            TerminalBuffer::Term(engine, _) => Some(
-                engine.with_renderable_content(|_content, display_iter, _screen_lines| {
+            TerminalBuffer::Term(engine, _) => {
+                // try_renderable_content returns Option<String>;
+                // None means lock failed (advance_bytes thread has the lock)
+                engine.try_renderable_content(|_content, display_iter, _screen_lines| {
                     extract_text_from_display_iter(display_iter)
-                }),
-            ),
+                })
+            }
             TerminalBuffer::Error(s) => Some(s.clone()),
         }
     }
@@ -246,13 +249,22 @@ impl TerminalView {
         let cursor_line = content.cursor.point.line.0;
         let cursor_col = content.cursor.point.column.0;
         let show_cursor = self.should_show_cursor();
+        // #region agent log
+        let _ = std::fs::OpenOptions::new().create(true).append(true).open("/Users/matt.chow/workspace/pmux/.cursor/debug-12d1c8.log").and_then(|mut f| {
+            use std::io::Write;
+            writeln!(f, "{{\"sessionId\":\"12d1c8\",\"id\":\"log_{}\",\"timestamp\":{},\"location\":\"terminal_view.rs:251\",\"message\":\"cursor position from term\",\"data\":{{\"cursor_line\":{},\"cursor_col\":{},\"show_cursor\":{},\"hypothesis\":\"A\"}},\"runId\":\"debug1\",\"hypothesisId\":\"A\"}}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis(), cursor_line, cursor_col, show_cursor)
+        });
+        // #endregion
 
-        row_cells
+        let result: Vec<AnyElement> = row_cells
             .into_iter()
-            .map(|cells| {
+            .enumerate()
+            .map(|(_idx, cells)| {
                 let row_line = cells.first().map(|c| c.point.line.0).unwrap_or(0);
                 let is_cursor_row = row_line == cursor_line;
+
                 let segments = group_cells_into_segments(cells.into_iter(), content.colors);
+
                 let cursor = if show_cursor && is_cursor_row {
                     Some(cursor_col)
                 } else {
@@ -269,9 +281,13 @@ impl TerminalView {
                     cache.put(content_hash, segments.clone());
                 }
 
-                render_batch_row(segments, cursor, show_cursor_on_row)
+                let row = render_batch_row(segments, cursor, show_cursor_on_row);
+
+                row
             })
-            .collect()
+            .collect();
+
+        result
     }
 }
 
@@ -286,9 +302,13 @@ impl RenderOnce for TerminalView {
             TerminalBuffer::Error(msg) => self.render_error(msg),
             TerminalBuffer::Term(engine, cache) => {
                 let mut cache_guard = cache.lock().unwrap();
-                engine.with_renderable_content(|content, display_iter, screen_lines| {
+
+                // Use try_renderable_content to avoid deadlock with advance_bytes thread
+                let result = engine.try_renderable_content(|content, display_iter, screen_lines| {
                     self.render_from_display_iter(content, display_iter, screen_lines, &mut cache_guard)
-                })
+                });
+
+                result.unwrap_or_else(Vec::new)
             }
         };
 

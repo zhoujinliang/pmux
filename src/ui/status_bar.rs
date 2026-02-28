@@ -42,14 +42,21 @@ impl StatusBar {
         self
     }
 
-    /// Build status bar from app context (worktree, branch, status counts)
+    /// Build status bar from app context (worktree, branch, status counts, backend)
     pub fn from_context(
         worktree_branch: Option<&str>,
         pane_count: usize,
         focused_pane: usize,
         status_counts: &StatusCounts,
+        backend: Option<&str>,
     ) -> Self {
         let mut left = Vec::new();
+        if let Some(b) = backend {
+            left.push(StatusBarItem {
+                text: format!("backend: {}", b),
+                title: Some("Runtime backend. Set via config.json or PMUX_BACKEND env. Priority: env > config > default".to_string()),
+            });
+        }
         if let Some(branch) = worktree_branch {
             left.push(StatusBarItem {
                 text: format!("git: ({})", branch),
@@ -72,6 +79,9 @@ impl StatusBar {
             }
             if status_counts.waiting > 0 {
                 parts.push(format!("◐ {} Waiting", status_counts.waiting));
+            }
+            if status_counts.waiting_confirm > 0 {
+                parts.push(format!("▲ {} Confirm", status_counts.waiting_confirm));
             }
             if status_counts.idle > 0 {
                 parts.push(format!("○ {} Idle", status_counts.idle));

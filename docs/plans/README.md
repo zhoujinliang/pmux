@@ -19,6 +19,18 @@
 
 **Phase 2+3 路线图**：[2026-02-phase2-phase3-roadmap.md](2026-02-phase2-phase3-roadmap.md) — 快速入口与实施建议
 
+## Recover / Attach 重构
+
+| 计划 | 目标 | 预估 |
+|------|------|------|
+| [2026-02-28-extract-attach-runtime-recover.md](2026-02-28-extract-attach-runtime-recover.md) | 抽出 `attach_runtime` 共享逻辑，实现 `try_recover_then_switch` / `try_recover_then_start`，接入 `recover_runtime` | ~0.5 天 |
+
+## Config 与 Backend (P1)
+
+| 计划 | 目标 | 预估 |
+|------|------|------|
+| [2026-02-28-p1-config-backend.md](2026-02-28-p1-config-backend.md) | config.json 支持 backend；env 覆盖 config；StatusBar 展示；加载时校验 | ~1 天 |
+
 ## 历史计划
 
 - [2026-02-25-spec2-implementation.md](2026-02-25-spec2-implementation.md) — Sidebar + Terminal 实现

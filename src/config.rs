@@ -18,6 +18,7 @@ impl Default for Config {
             workspace_paths: vec![],
             active_workspace_index: 0,
             per_repo_worktree_index: HashMap::new(),
+            backend: default_backend(),
         }
     }
 }
@@ -51,6 +52,9 @@ pub struct Config {
     /// Per-repo worktree index: path string -> worktree index
     #[serde(default)]
     pub per_repo_worktree_index: HashMap<String, usize>,
+    /// Runtime backend: "local" (PTY) or "tmux". Env PMUX_BACKEND overrides.
+    #[serde(default = "default_backend")]
+    pub backend: String,
 }
 
 impl Config {
@@ -76,6 +80,15 @@ impl Config {
 
         let content = std::fs::read_to_string(path)?;
         let mut config: Config = serde_json::from_str(&content)?;
+        // Validate backend; log warning and fallback if invalid
+        const VALID_BACKENDS: [&str; 2] = ["local", "tmux"];
+        if !VALID_BACKENDS.contains(&config.backend.as_str()) {
+            eprintln!(
+                "pmux: invalid backend '{}' in config, using 'local'. Valid: local, tmux",
+                config.backend
+            );
+            config.backend = "local".to_string();
+        }
         config.migrate_from_legacy();
         Ok(config)
     }
@@ -225,6 +238,7 @@ mod tests {
 
         let config = Config {
             recent_workspace: Some("/home/user/project".to_string()),
+            ..Default::default()
         };
 
         // Act: Save config
@@ -262,6 +276,7 @@ mod tests {
 
         let config = Config {
             recent_workspace: Some("/workspace/myrepo".to_string()),
+            ..Default::default()
         };
         config.save_to_path(&config_path).unwrap();
 
@@ -325,6 +340,26 @@ mod tests {
         assert_eq!(loaded_per_repo.get(&PathBuf::from("/path/repo2")), Some(&0));
     }
 
+    /// Test: Config invalid backend falls back to local
+    #[test]
+    fn test_config_load_invalid_backend_fallback() {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("config.json");
+        std::fs::write(&path, r#"{"backend": "docker"}"#).unwrap();
+        let config = Config::load_from_path(&path).unwrap();
+        assert_eq!(config.backend, "local");
+    }
+
+    /// Test: Config backend field is loaded from JSON
+    #[test]
+    fn test_config_backend_field() {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("config.json");
+        std::fs::write(&path, r#"{"backend": "tmux"}"#).unwrap();
+        let config = Config::load_from_path(&path).unwrap();
+        assert_eq!(config.backend, "tmux");
+    }
+
     /// Test: migrate_from_legacy populates workspace_paths from recent_workspace
     #[test]
     fn test_config_migrate_from_legacy() {
@@ -333,6 +368,7 @@ mod tests {
             workspace_paths: vec![],
             active_workspace_index: 0,
             per_repo_worktree_index: HashMap::new(),
+            ..Default::default()
         };
 
         config.migrate_from_legacy();

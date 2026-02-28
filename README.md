@@ -80,6 +80,12 @@ python3 -m venv .venv-icon && .venv-icon/bin/pip install -r resources/requiremen
 ./scripts/bundle.sh --dev
 ```
 
+## Backend 配置
+
+- **config.json**：`~/.config/pmux/config.json` 中可设置 `"backend": "tmux"` 或 `"backend": "local"`（默认 local）
+- **环境变量**：`PMUX_BACKEND=tmux` 或 `PMUX_BACKEND=local` 可覆盖 config
+- **优先级**：环境变量 > config > 默认 (local)
+
 ## 项目结构
 
 ```

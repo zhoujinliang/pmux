@@ -13,6 +13,7 @@ pub use tmux::TmuxRuntime;
 use std::path::Path;
 use std::sync::Arc;
 
+use crate::config::Config;
 use crate::runtime::agent_runtime::{AgentRuntime, RuntimeError};
 use crate::runtime::WorktreeState;
 
@@ -22,51 +23,76 @@ pub const PMUX_BACKEND_ENV: &str = "PMUX_BACKEND";
 /// Default backend when environment variable is not set.
 pub const DEFAULT_BACKEND: &str = "local";
 
-/// Session naming for tmux backend. One worktree = one session.
-/// Example: /foo/repo/feature-x -> "pmux-feature-x"
-pub fn session_name_for_worktree(worktree_path: &Path) -> String {
+/// Resolve backend: PMUX_BACKEND env > config.backend > "local".
+/// Invalid values (non-local/tmux) fall back to "local".
+pub fn resolve_backend(config: Option<&Config>) -> String {
+    const VALID: [&str; 2] = ["local", "tmux"];
+    let from_env = std::env::var(PMUX_BACKEND_ENV).ok();
+    let from_config = config.map(|c| c.backend.as_str());
+    let raw = from_env.as_deref().or(from_config).unwrap_or(DEFAULT_BACKEND);
+    if VALID.contains(&raw) {
+        raw.to_string()
+    } else {
+        DEFAULT_BACKEND.to_string()
+    }
+}
+
+/// Session naming for tmux backend. One workspace (repo) = one session.
+/// Example: /foo/repo -> "pmux-repo"
+pub fn session_name_for_workspace(workspace_path: &Path) -> String {
     format!(
         "pmux-{}",
-        worktree_path
+        workspace_path
             .file_name()
             .map(|n| n.to_string_lossy())
             .unwrap_or_else(|| "default".into())
     )
 }
 
-/// Default main window name for a worktree session.
-pub const MAIN_WINDOW: &str = "main";
-
-/// Window target for killing the main worktree session.
-/// Used when deleting a worktree (kill its session's main window).
-pub fn main_window_target(worktree_path: &Path) -> String {
-    format!("{}:{}", session_name_for_worktree(worktree_path), MAIN_WINDOW)
+/// Window naming for tmux backend. One worktree/agent = one window.
+/// Main worktree -> "main"; linked worktrees -> sanitized branch name.
+pub fn window_name_for_worktree(worktree_path: &Path, branch_name: &str) -> String {
+    let name = if branch_name.is_empty() || branch_name == "main" {
+        "main".to_string()
+    } else {
+        branch_name.to_string()
+    };
+    name.chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '-' })
+        .collect::<String>()
 }
 
-/// Create a runtime for the given worktree path, using the backend specified
-/// by the `PMUX_BACKEND` environment variable (defaults to local PTY).
+/// Target for killing a worktree's window: session:window
+pub fn window_target(workspace_path: &Path, window_name: &str) -> String {
+    format!("{}:{}", session_name_for_workspace(workspace_path), window_name)
+}
+
+/// Create a runtime for the given worktree.
+/// Backend resolution: PMUX_BACKEND env > config.backend > "local".
+///
+/// Tmux: one workspace = one session, one worktree = one window.
 ///
 /// # Examples
 /// ```bash
-/// # Use local PTY (default)
-/// pmux
-///
-/// # Use tmux for session persistence
 /// PMUX_BACKEND=tmux pmux
 /// ```
 pub fn create_runtime_from_env(
+    workspace_path: &Path,
     worktree_path: &Path,
+    branch_name: &str,
     cols: u16,
     rows: u16,
+    config: Option<&Config>,
 ) -> Result<Arc<dyn AgentRuntime>, RuntimeError> {
-    let backend = std::env::var(PMUX_BACKEND_ENV).unwrap_or_else(|_| DEFAULT_BACKEND.to_string());
+    let backend = resolve_backend(config);
 
     match backend.as_str() {
         "tmux" => {
             #[cfg(unix)]
             {
-                let session_name = session_name_for_worktree(worktree_path);
-                Ok(create_tmux_runtime(session_name, MAIN_WINDOW))
+                let session_name = session_name_for_workspace(workspace_path);
+                let window_name = window_name_for_worktree(worktree_path, branch_name);
+                Ok(create_tmux_runtime(session_name, window_name))
             }
             #[cfg(not(unix))]
             Err(RuntimeError::Backend(
@@ -159,8 +185,40 @@ pub fn recover_runtime(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::Config;
     use crate::runtime::WorktreeState;
     use std::path::PathBuf;
+
+    #[test]
+    fn test_resolve_backend_env_overrides_config() {
+        std::env::set_var(PMUX_BACKEND_ENV, "tmux");
+        let config = Config {
+            backend: "local".into(),
+            ..Config::default()
+        };
+        assert_eq!(resolve_backend(Some(&config)), "tmux");
+        std::env::remove_var(PMUX_BACKEND_ENV);
+    }
+
+    #[test]
+    fn test_resolve_backend_config_overrides_default() {
+        std::env::remove_var(PMUX_BACKEND_ENV);
+        let config = Config {
+            backend: "tmux".into(),
+            ..Config::default()
+        };
+        assert_eq!(resolve_backend(Some(&config)), "tmux");
+    }
+
+    #[test]
+    fn test_resolve_backend_invalid_fallback() {
+        std::env::remove_var(PMUX_BACKEND_ENV);
+        let config = Config {
+            backend: "docker".into(),
+            ..Config::default()
+        };
+        assert_eq!(resolve_backend(Some(&config)), "local");
+    }
 
     #[test]
     fn test_recover_runtime_unknown_backend() {
@@ -172,6 +230,7 @@ mod tests {
             backend: "unknown".to_string(),
             backend_session_id: String::new(),
             backend_window_id: String::new(),
+            split_tree_json: None,
         };
         let result = recover_runtime("unknown_backend", &state, None);
         assert!(result.is_err());
@@ -187,6 +246,7 @@ mod tests {
             backend: "local".to_string(),
             backend_session_id: String::new(),
             backend_window_id: String::new(),
+            split_tree_json: None,
         };
         let result = recover_runtime("local", &state, None);
         assert!(result.is_err());
