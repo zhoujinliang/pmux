@@ -46,7 +46,8 @@ cargo check
 - `app_root.rs` - Root GPUI component, manages application state and view switching
 - `sidebar.rs` - Left sidebar showing worktree list
 - `tabbar.rs` - Tab bar for multi-workspace navigation
-- `terminal_view.rs` - Terminal rendering with content polling
+- `terminal_view.rs` - Terminal rendering with content polling; uses style-run batching (see terminal_rendering.rs)
+- `terminal_rendering.rs` - Style-run batching: groups consecutive same-style cells into segments; pipeline: Grid → Segments → Elements → GPUI; ~97% element reduction vs per-cell
 - `new_branch_dialog_ui.rs` - Modal dialog for branch creation
 
 **State Management**
@@ -64,9 +65,13 @@ cargo check
 - `git_utils.rs` - Repository validation
 - `worktree_manager.rs` - Worktree creation and management
 
+**Shell Integration (`src/`)**
+- `shell_integration.rs` - OSC 133 parser and shell state (MarkerKind, ShellPhase, ShellMarker, Osc133Parser)
+- Flow: shell emits OSC 133 (A/B/C/D) → TerminalEngine.advance_with_osc133() → ShellState → StatusDetector
+
 **Agent Status Detection (`src/`)**
 - `agent_status.rs` - Agent status enumeration (Running, Waiting, Idle, Error, Unknown) with display properties
-- `status_detector.rs` - Analyzes pane content to determine agent status
+- `status_detector.rs` - Analyzes pane content to determine agent status; uses ShellPhaseInfo when OSC 133 available, falls back to text patterns
 - `StatusPublisher` - Publishes agent state changes via Event Bus (reads from stream/Term buffers; no capture-pane)
 
 **Input Handling**
@@ -110,6 +115,14 @@ impl Render for AppRoot {
 - Tmux operations return `SessionError`, `PaneError`, `WindowError`
 - Error messages should be user-friendly (some in Chinese for the target audience)
 
+### Shell Integration Flow
+1. Shell (zsh/bash/fish) emits OSC 133 sequences (A=PromptStart, B=PromptEnd, C=PreExec, D=PostExec)
+2. TerminalEngine.advance_with_osc133() parses bytes via Osc133Parser, updates ShellState
+3. StatusDetector.detect_with_shell_phase() uses ShellPhaseInfo when available (Running→Running, PostExec+exit≠0→Error)
+4. Fallback: when OSC 133 unavailable, text-based detection (patterns like "thinking", "?") still works
+
+See `docs/shell-integration.md` for user shell configuration.
+
 ### State Flow
 1. AppRoot loads Config on startup
 2. Valid workspace triggers tmux session creation via `start_tmux_session()`
@@ -135,4 +148,5 @@ impl Render for AppRoot {
 - The UI uses a dark theme with rgb(0x1e1e1e) as the background color
 - Git repository validation supports normal repos, bare repos, and worktrees
 - Agent status detection uses background polling (500ms) with debouncing to avoid UI flicker
+- Shell integration (OSC 133) improves status accuracy when enabled in user's shell; see docs/shell-integration.md
 - Status updates propagate from StatusPoller → AppRoot HashMap → Sidebar/TopBar via cx.notify()

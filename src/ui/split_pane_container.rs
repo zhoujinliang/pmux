@@ -5,7 +5,7 @@ use gpui::prelude::*;
 use gpui::{relative, CursorStyle, *};
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 const DIVIDER_WIDTH: f32 = 4.0;
 const RATIO_SENSITIVITY: f32 = 0.002; // pixels to ratio: 500px drag = 1.0 ratio change
@@ -191,7 +191,7 @@ impl SplitPaneContainer {
                     .get(target)
                     .cloned()
                     .unwrap_or_else(|| {
-                        TerminalBuffer::Term(Arc::new(Mutex::new(crate::terminal::TermBridge::new(80, 24))))
+                        TerminalBuffer::new_term(crate::terminal::TermBridge::new(80, 24))
                     });
                 let title = self.pane_title(target);
                 let is_focused = pane_index_offset == focused_pane_index;

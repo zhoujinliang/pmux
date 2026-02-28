@@ -1,8 +1,9 @@
 // terminal/term_bridge.rs - Bridge to alacritty_terminal::Term for VT parsing
 use alacritty_terminal::event::VoidListener;
-use alacritty_terminal::grid::Dimensions;
-use alacritty_terminal::term::cell::Flags;
+use alacritty_terminal::grid::{Dimensions, GridIterator};
+use alacritty_terminal::term::cell::{Cell, Flags};
 use alacritty_terminal::term::{Config, Term};
+pub use alacritty_terminal::term::{RenderableContent, RenderableCursor};
 use alacritty_terminal::vte::ansi::{self, Color, NamedColor, Rgb};
 use std::sync::Mutex;
 
@@ -91,8 +92,26 @@ impl TermBridge {
         self.term.lock().unwrap()
     }
 
+    /// Get renderable content for frame loop rendering.
+    /// Calls `f` with (content, display_iter, screen_lines). Use the iterator for cells; content provides colors and cursor.
+    pub fn with_renderable_content<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce(
+            &alacritty_terminal::term::RenderableContent<'_>,
+            GridIterator<'_, Cell>,
+            usize,
+        ) -> R,
+    {
+        let term = self.term.lock().unwrap();
+        let content = term.renderable_content();
+        let display_iter = term.grid().display_iter();
+        let screen_lines = term.grid().screen_lines();
+        f(&content, display_iter, screen_lines)
+    }
+
     /// Resolve Color to Rgb using term's color table, with fallbacks for unset colors.
-    fn resolve_color(color: Color, colors: &alacritty_terminal::term::color::Colors) -> Rgb {
+    /// Public for use by terminal_rendering when grouping cells.
+    pub(crate) fn resolve_color(color: Color, colors: &alacritty_terminal::term::color::Colors) -> Rgb {
         match color {
             Color::Spec(rgb) => rgb,
             Color::Named(n) => {

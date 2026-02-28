@@ -1,0 +1,253 @@
+// terminal/term_bridge.rs - Bridge to alacritty_terminal::Term for VT parsing
+use alacritty_terminal::event::VoidListener;
+use alacritty_terminal::grid::{Dimensions, GridIterator};
+use alacritty_terminal::term::cell::{Cell, Flags};
+use alacritty_terminal::term::TermMode;
+use alacritty_terminal::term::{Config, Term};
+
+// Re-export for terminal module consumers
+pub use alacritty_terminal::term::{RenderableContent, RenderableCursor};
+use alacritty_terminal::vte::ansi::{self, Color, NamedColor, Rgb};
+use std::sync::Mutex;
+
+/// Zed One Dark terminal colors (from Zed's built-in theme)
+const DEFAULT_FG: Rgb = Rgb { r: 0xab, g: 0xb2, b: 0xbf }; // terminal.foreground
+const DEFAULT_BG: Rgb = Rgb { r: 0x28, g: 0x2c, b: 0x34 }; // terminal.background
+
+/// Styled cell: (char, fg_rgb, bg_rgb) for rendering with ANSI colors.
+pub type StyledCell = (char, [u8; 3], [u8; 3]);
+
+/// Zed One Dark ANSI 16-color palette (terminal.ansi.*)
+const ZED_ONE_DARK_16: [Rgb; 16] = [
+    Rgb { r: 0x28, g: 0x2c, b: 0x34 }, // black
+    Rgb { r: 0xe0, g: 0x6c, b: 0x75 }, // red
+    Rgb { r: 0x98, g: 0xc3, b: 0x79 }, // green
+    Rgb { r: 0xe5, g: 0xc0, b: 0x7b }, // yellow
+    Rgb { r: 0x61, g: 0xaf, b: 0xef }, // blue
+    Rgb { r: 0xc6, g: 0x78, b: 0xdd }, // magenta
+    Rgb { r: 0x56, g: 0xb6, b: 0xc2 }, // cyan
+    Rgb { r: 0xab, g: 0xb2, b: 0xbf }, // white
+    Rgb { r: 0x63, g: 0x6d, b: 0x83 }, // bright black
+    Rgb { r: 0xea, g: 0x85, b: 0x8b }, // bright red
+    Rgb { r: 0xaa, g: 0xd5, b: 0x81 }, // bright green
+    Rgb { r: 0xff, g: 0xd8, b: 0x85 }, // bright yellow
+    Rgb { r: 0x85, g: 0xc1, b: 0xff }, // bright blue
+    Rgb { r: 0xd3, g: 0x98, b: 0xeb }, // bright magenta
+    Rgb { r: 0x6e, g: 0xd5, b: 0xde }, // bright cyan
+    Rgb { r: 0xfa, g: 0xfa, b: 0xfa }, // bright white
+];
+
+/// Fixed terminal dimensions for pane display.
+#[derive(Debug, Clone, Copy)]
+struct TermDimensions {
+    columns: usize,
+    screen_lines: usize,
+}
+
+impl Dimensions for TermDimensions {
+    fn total_lines(&self) -> usize {
+        self.screen_lines
+    }
+
+    fn screen_lines(&self) -> usize {
+        self.screen_lines
+    }
+
+    fn columns(&self) -> usize {
+        self.columns
+    }
+}
+
+/// Bridge to alacritty_terminal::Term for parsing VT sequences from terminal output.
+pub struct TermBridge {
+    term: Mutex<Term<VoidListener>>,
+    parser: Mutex<ansi::Processor>,
+}
+
+impl TermBridge {
+    /// Create a new TermBridge with the given dimensions (columns, lines).
+    pub fn new(columns: usize, screen_lines: usize) -> Self {
+        let size = TermDimensions { columns, screen_lines };
+        let term = Term::new(Config::default(), &size, VoidListener);
+        Self {
+            term: Mutex::new(term),
+            parser: Mutex::new(ansi::Processor::new()),
+        }
+    }
+
+    /// Resize the terminal to new dimensions. PTY should be resized separately via runtime.resize().
+    pub fn resize(&self, columns: usize, screen_lines: usize) {
+        let size = TermDimensions { columns, screen_lines };
+        if let Ok(mut term) = self.term.lock() {
+            term.resize(size);
+        }
+    }
+
+    /// Feed raw bytes (VT sequences) to the terminal. Call this with output from tmux control mode.
+    pub fn advance(&self, bytes: &[u8]) {
+        if let (Ok(mut term), Ok(mut parser)) = (self.term.lock(), self.parser.lock()) {
+            parser.advance(&mut *term, bytes);
+        }
+    }
+
+    /// Access the underlying Term for rendering.
+    pub fn term(&self) -> std::sync::MutexGuard<'_, Term<VoidListener>> {
+        self.term.lock().unwrap()
+    }
+
+    /// Get renderable content for frame loop rendering.
+    /// Calls `f` with (content, display_iter). Use the iterator for cells; content provides colors and cursor.
+    /// The display_iter is from term.grid().display_iter() so it can be consumed without moving from content.
+    ///
+    /// Due to lifetime constraints, `RenderableContent` borrows from the term and cannot be returned
+    /// directly. Use this closure-based API, or `term().renderable_content()` for direct access.
+    pub fn with_renderable_content<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce(&RenderableContent<'_>, GridIterator<'_, Cell>) -> R,
+    {
+        let term = self.term.lock().unwrap();
+        let content = term.renderable_content();
+        let display_iter = term.grid().display_iter();
+        f(&content, display_iter)
+    }
+
+    /// Get cursor info from renderable content (shape and point).
+    pub fn cursor_info(&self) -> RenderableCursor {
+        let term = self.term.lock().unwrap();
+        let content = term.renderable_content();
+        content.cursor
+    }
+
+    /// Get cursor position in viewport coordinates (row, col) using cursor_info.
+    /// Matches the coordinate system used by display_iter.
+    pub fn cursor_viewport(&self) -> Option<(usize, usize)> {
+        let term = self.term.lock().unwrap();
+        let cursor = term.renderable_content().cursor;
+        let display_offset = term.grid().display_offset();
+        let cursor_row = (cursor.point.line.0 + display_offset as i32) as usize;
+        let cursor_col = cursor.point.column.0;
+        Some((cursor_row, cursor_col))
+    }
+
+    /// Resolve Color to Rgb using term's color table, with fallbacks for unset colors.
+    /// Public for use by TerminalView when rendering from renderable_content.
+    pub(crate) fn resolve_color(color: Color, colors: &alacritty_terminal::term::color::Colors) -> Rgb {
+        match color {
+            Color::Spec(rgb) => rgb,
+            Color::Named(n) => {
+                let idx = n as usize;
+                colors[idx]
+                    .or_else(|| {
+                        if idx < 16 {
+                            Some(ZED_ONE_DARK_16[idx])
+                        } else if n == NamedColor::Foreground || n == NamedColor::BrightForeground {
+                            Some(DEFAULT_FG)
+                        } else if n == NamedColor::Background {
+                            Some(DEFAULT_BG)
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or(DEFAULT_FG)
+            }
+            Color::Indexed(i) => colors[i as usize].unwrap_or_else(|| {
+                if i < 16 {
+                    ZED_ONE_DARK_16[i as usize]
+                } else {
+                    DEFAULT_FG
+                }
+            }),
+        }
+    }
+
+    /// Get cursor position (row, col) matching display_iter row indexing.
+    pub fn cursor_position(&self) -> Option<(usize, usize)> {
+        let term = self.term.lock().unwrap();
+        let grid = term.grid();
+        let display_offset = grid.display_offset();
+        let cursor = grid.cursor.point;
+        let viewport_line = (cursor.line.0 + display_offset as i32) as usize;
+        let col = cursor.column.0;
+        Some((viewport_line, col))
+    }
+
+    /// Returns true when a TUI app (vim, neovim, Claude Code, etc.) is active.
+    /// Detection: alternate screen mode (ESC[?1049h) is set by full-screen TUI apps.
+    /// When true, our cursor should be hidden; the TUI app renders its own cursor.
+    pub fn is_tui_active(&self) -> bool {
+        let term = self.term.lock().unwrap();
+        term.mode().contains(TermMode::ALT_SCREEN)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// ESC[?1049h - Enter alternate screen (smcup). Used by vim, neovim, Claude Code.
+    const ENTER_ALT_SCREEN: &[u8] = b"\x1b[?1049h";
+    /// ESC[?1049l - Exit alternate screen (rmcup).
+    const EXIT_ALT_SCREEN: &[u8] = b"\x1b[?1049l";
+
+    #[test]
+    fn test_is_tui_active_false_when_normal_shell() {
+        let bridge = TermBridge::new(80, 24);
+        assert!(!bridge.is_tui_active(), "normal shell should not be TUI");
+    }
+
+    #[test]
+    fn test_is_tui_active_true_after_enter_alt_screen() {
+        let bridge = TermBridge::new(80, 24);
+        bridge.advance(ENTER_ALT_SCREEN);
+        assert!(bridge.is_tui_active(), "after smcup, TUI should be active");
+    }
+
+    #[test]
+    fn test_is_tui_active_false_after_exit_alt_screen() {
+        let bridge = TermBridge::new(80, 24);
+        bridge.advance(ENTER_ALT_SCREEN);
+        assert!(bridge.is_tui_active());
+        bridge.advance(EXIT_ALT_SCREEN);
+        assert!(!bridge.is_tui_active(), "after rmcup, TUI should be inactive");
+    }
+
+    #[test]
+    fn test_is_tui_active_toggle() {
+        let bridge = TermBridge::new(80, 24);
+        assert!(!bridge.is_tui_active());
+        bridge.advance(ENTER_ALT_SCREEN);
+        assert!(bridge.is_tui_active());
+        bridge.advance(EXIT_ALT_SCREEN);
+        assert!(!bridge.is_tui_active());
+        bridge.advance(ENTER_ALT_SCREEN);
+        assert!(bridge.is_tui_active());
+    }
+
+    #[test]
+    fn test_renderable_content() {
+        let bridge = TermBridge::new(80, 24);
+        bridge.advance(b"hello world");
+        let text = bridge.with_renderable_content(|_content, display_iter| {
+            let mut chars = Vec::new();
+            for indexed in display_iter {
+                if indexed.cell.c != '\0' && indexed.cell.c != ' ' {
+                    chars.push(indexed.cell.c);
+                }
+            }
+            chars.into_iter().collect::<String>()
+        });
+        assert!(
+            text.contains("hello") || text.contains("world"),
+            "renderable_content should contain cells from 'hello world', got: {:?}",
+            text
+        );
+    }
+
+    #[test]
+    fn test_cursor_info() {
+        let bridge = TermBridge::new(80, 24);
+        bridge.advance(b"hello");
+        let cursor = bridge.cursor_info();
+        assert_eq!(cursor.point.column.0, 5, "cursor should be after 'hello'");
+    }
+}

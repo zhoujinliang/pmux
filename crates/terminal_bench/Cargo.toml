@@ -1,0 +1,18 @@
+[package]
+name = "terminal_bench"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+alacritty_terminal = "0.25.1"
+vte = "0.15"
+pmux = { path = "../.." }
+lru = "0.12"
+
+[dev-dependencies]
+criterion = "0.5"
+
+[[bench]]
+name = "terminal_rendering"
+harness = false

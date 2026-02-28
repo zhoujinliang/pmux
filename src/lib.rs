@@ -20,6 +20,7 @@ pub mod notification;
 pub mod notification_manager;
 pub mod resizable_sidebar;
 pub mod runtime;
+pub mod shell_integration;
 pub mod status_detector;
 pub mod system_notifier;
 pub mod terminal;

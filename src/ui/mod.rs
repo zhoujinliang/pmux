@@ -8,6 +8,7 @@ pub mod sidebar;
 pub mod split_pane_container;
 pub mod status_bar;
 pub mod tabbar;
+pub mod terminal_rendering;
 pub mod terminal_view;
 pub mod topbar;
 pub mod workspace_tabbar;

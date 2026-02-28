@@ -1,6 +1,22 @@
 // config.rs - Configuration management for pmux
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+
+fn default_terminal_row_cache_size() -> usize {
+    200
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            terminal_row_cache_size: 200,
+            recent_workspace: None,
+            workspace_paths: vec![],
+            active_workspace_index: 0,
+            per_repo_worktree_index: HashMap::new(),
+        }
+    }
+}
 use std::path::PathBuf;
 use thiserror::Error;
 
@@ -14,8 +30,11 @@ pub enum ConfigError {
 }
 
 /// Application configuration
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
+    /// Terminal row cache size (LRU). Default 200. Used for scrolling performance.
+    #[serde(default = "default_terminal_row_cache_size")]
+    pub terminal_row_cache_size: usize,
     /// Legacy single workspace path (for backward compatibility)
     #[serde(default)]
     pub recent_workspace: Option<String>,
@@ -115,6 +134,15 @@ impl Config {
             .filter_map(|(k, v)| k.to_str().map(|s| (s.to_string(), *v)))
             .collect();
         self.recent_workspace = self.workspace_paths.first().cloned();
+    }
+
+    /// Get terminal row cache size (default 200)
+    pub fn terminal_row_cache_size(&self) -> usize {
+        if self.terminal_row_cache_size == 0 {
+            200
+        } else {
+            self.terminal_row_cache_size
+        }
     }
 
     /// Get per-repo worktree index as PathBuf -> usize

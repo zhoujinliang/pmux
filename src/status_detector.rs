@@ -1,5 +1,6 @@
 // status_detector.rs - Agent status detection from terminal output
 use crate::agent_status::AgentStatus;
+use crate::shell_integration::{ShellPhase, ShellPhaseInfo};
 use regex::Regex;
 
 /// Detects agent status from terminal content
@@ -77,27 +78,58 @@ impl StatusDetector {
 
     /// Detect status from content
     /// Priority: Error > Waiting > Running > Idle > Unknown
+    /// Uses text-based detection only (no OSC 133).
     pub fn detect(&self, content: &str) -> AgentStatus {
+        self.detect_with_shell_phase(content, None)
+    }
+
+    /// Detect status from content, with optional OSC 133 shell phase info.
+    /// When shell_phase is available: Running → Running, Output+exit!=0 → Error.
+    /// Otherwise falls back to text-based detection (Task 4.4).
+    /// Priority: Error > Waiting > Running > Idle > Unknown
+    pub fn detect_with_shell_phase(
+        &self,
+        content: &str,
+        shell_info: Option<ShellPhaseInfo>,
+    ) -> AgentStatus {
+        // Task 4.2: PreExec (Running phase) → AgentStatus::Running
+        if let Some(info) = shell_info {
+            if info.phase == ShellPhase::Running {
+                return AgentStatus::Running;
+            }
+            // Task 4.3: PostExec with error → AgentStatus::Error
+            if info.phase == ShellPhase::Output {
+                if let Some(code) = info.last_post_exec_exit_code {
+                    if code != 0 {
+                        return AgentStatus::Error;
+                    }
+                }
+            }
+            // Task 4.4: If phase is Unknown, fall through to text detection
+            // For Prompt, Input, Output (success): use text detection for Waiting/Running/Idle
+        }
+
+        // Task 4.4: Fallback to text-based detection
         let processed = self.preprocess(content);
-        
+
         // Check in priority order
         if self.matches_error(&processed) {
             return AgentStatus::Error;
         }
-        
+
         if self.matches_waiting(&processed) {
             return AgentStatus::Waiting;
         }
-        
+
         if self.matches_running(&processed) {
             return AgentStatus::Running;
         }
-        
+
         // If content is not empty but no patterns match, it's Idle
         if !processed.trim().is_empty() {
             return AgentStatus::Idle;
         }
-        
+
         AgentStatus::Unknown
     }
 
@@ -261,6 +293,157 @@ impl Default for DebouncedStatusTracker {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::shell_integration::{MarkerKind, ParsedMarker, ShellMarker, ShellPhase, ShellPhaseInfo};
+    use crate::terminal::TerminalEngine;
+
+    // --- Phase 4: OSC 133 shell phase integration tests ---
+
+    #[test]
+    fn test_detect_with_shell_phase_running() {
+        let detector = StatusDetector::new();
+        let info = ShellPhaseInfo {
+            phase: ShellPhase::Running,
+            last_post_exec_exit_code: None,
+        };
+        let status = detector.detect_with_shell_phase("$ ls -la\nsome output", Some(info));
+        assert_eq!(status, AgentStatus::Running);
+    }
+
+    #[test]
+    fn test_detect_with_shell_phase_output_error() {
+        let detector = StatusDetector::new();
+        let info = ShellPhaseInfo {
+            phase: ShellPhase::Output,
+            last_post_exec_exit_code: Some(1),
+        };
+        let status = detector.detect_with_shell_phase("command output", Some(info));
+        assert_eq!(status, AgentStatus::Error);
+    }
+
+    #[test]
+    fn test_detect_with_shell_phase_output_success() {
+        let detector = StatusDetector::new();
+        let info = ShellPhaseInfo {
+            phase: ShellPhase::Output,
+            last_post_exec_exit_code: Some(0),
+        };
+        let status = detector.detect_with_shell_phase("$ echo done\ndone", Some(info));
+        assert_eq!(status, AgentStatus::Idle);
+    }
+
+    #[test]
+    fn test_detect_with_shell_phase_unknown_fallback() {
+        let detector = StatusDetector::new();
+        let info = ShellPhaseInfo {
+            phase: ShellPhase::Unknown,
+            last_post_exec_exit_code: None,
+        };
+        assert_eq!(
+            detector.detect_with_shell_phase("AI is thinking", Some(info)),
+            AgentStatus::Running
+        );
+        assert_eq!(
+            detector.detect_with_shell_phase("? What next?", Some(info)),
+            AgentStatus::Waiting
+        );
+    }
+
+    #[test]
+    fn test_detect_with_shell_phase_none_fallback() {
+        let detector = StatusDetector::new();
+        assert_eq!(
+            detector.detect_with_shell_phase("AI is thinking", None),
+            detector.detect("AI is thinking")
+        );
+    }
+
+    #[test]
+    fn test_detect_with_shell_phase_priority_running_over_text() {
+        let detector = StatusDetector::new();
+        let info = ShellPhaseInfo {
+            phase: ShellPhase::Running,
+            last_post_exec_exit_code: None,
+        };
+        let status = detector.detect_with_shell_phase("error in log", Some(info));
+        assert_eq!(status, AgentStatus::Running);
+    }
+
+    #[test]
+    fn test_detect_with_shell_phase_output_exit_2() {
+        let detector = StatusDetector::new();
+        let info = ShellPhaseInfo {
+            phase: ShellPhase::Output,
+            last_post_exec_exit_code: Some(2),
+        };
+        assert_eq!(
+            detector.detect_with_shell_phase("any content", Some(info)),
+            AgentStatus::Error
+        );
+    }
+
+    #[test]
+    fn test_integration_with_terminal_engine() {
+        let (tx, rx) = flume::unbounded();
+        let engine = TerminalEngine::new(80, 24, rx);
+        drop(tx);
+
+        let detector = StatusDetector::new();
+
+        let info = ShellPhaseInfo {
+            phase: engine.shell_phase(),
+            last_post_exec_exit_code: engine.last_post_exec_exit_code(),
+        };
+        assert_eq!(info.phase, ShellPhase::Unknown);
+        assert_eq!(
+            detector.detect_with_shell_phase("hello", Some(info)),
+            AgentStatus::Idle
+        );
+
+        {
+            let mut state = engine.shell_state();
+            let marker = ShellMarker::from_parsed(
+                ParsedMarker {
+                    kind: MarkerKind::PreExec,
+                    exit_code: None,
+                },
+                0,
+                0,
+            );
+            state.add_marker(marker);
+        }
+        let info = ShellPhaseInfo {
+            phase: engine.shell_phase(),
+            last_post_exec_exit_code: engine.last_post_exec_exit_code(),
+        };
+        assert_eq!(info.phase, ShellPhase::Running);
+        assert_eq!(
+            detector.detect_with_shell_phase("any content", Some(info)),
+            AgentStatus::Running
+        );
+
+        {
+            let mut state = engine.shell_state();
+            let marker = ShellMarker::from_parsed(
+                ParsedMarker {
+                    kind: MarkerKind::PostExec,
+                    exit_code: Some(1),
+                },
+                1,
+                0,
+            );
+            state.add_marker(marker);
+        }
+        let info = ShellPhaseInfo {
+            phase: engine.shell_phase(),
+            last_post_exec_exit_code: engine.last_post_exec_exit_code(),
+        };
+        assert_eq!(info.phase, ShellPhase::Output);
+        assert_eq!(info.last_post_exec_exit_code, Some(1));
+        assert_eq!(
+            detector.detect_with_shell_phase("output", Some(info)),
+            AgentStatus::Error
+        );
+    }
 
     #[test]
     fn test_detector_creation() {
