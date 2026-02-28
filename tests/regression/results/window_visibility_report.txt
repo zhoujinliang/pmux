@@ -1,12 +1,12 @@
 Window Visibility Report
 ========================
-Test Time: Sat Feb 28 16:59:09 CST 2026
+Test Time: Sat Feb 28 18:08:47 CST 2026
 
-Screenshot: /Users/matt.chow/workspace/pmux/tests/regression/../results/screenshots/window_visibility_20260228_165906.png
+Screenshot: /Users/matt.chow/workspace/pmux/tests/regression/../results/screenshots/window_visibility_20260228_180844.png
 Result: True
 Reason: ok
-Avg Brightness: 115.8
-Variance: 7726.6
+Avg Brightness: 117.7
+Variance: 7601.0
 Size: 3840x2160
 
 Notes:

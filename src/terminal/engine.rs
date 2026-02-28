@@ -7,6 +7,7 @@ use alacritty_terminal::term::TermMode;
 use alacritty_terminal::term::{Config, Term};
 use alacritty_terminal::vte::ansi::Processor;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 /// Fixed terminal dimensions for engine display.
 #[derive(Debug, Clone, Copy)]
@@ -79,6 +80,48 @@ impl TerminalEngine {
         changed
     }
 
+    /// Event-driven: block up to `timeout` for first byte chunk, then drain and process all pending.
+    /// Returns Some(changed) on success, None if channel disconnected.
+    /// Zed-style: data available → process immediately; no data → short timeout, then drain any spurts.
+    pub fn advance_bytes_with_timeout(&self, timeout: Duration) -> Option<bool> {
+        use flume::RecvTimeoutError;
+        let first = match self.byte_rx.recv_timeout(timeout) {
+            Ok(b) => {
+                // #region agent log
+                if !b.is_empty() {
+                    crate::debug_log::dbg_log(
+                        "engine.rs:advance_bytes_with_timeout",
+                        "recv got data",
+                        &serde_json::json!({"len": b.len()}),
+                        "H5",
+                    );
+                }
+                // #endregion
+                b
+            }
+            Err(RecvTimeoutError::Timeout) => return Some(self.advance_bytes()),
+            Err(RecvTimeoutError::Disconnected) => return None,
+        };
+        let Ok(mut term) = self.terminal.try_lock() else {
+            return Some(false);
+        };
+        let Ok(mut processor) = self.processor.try_lock() else {
+            return Some(false);
+        };
+        let mut changed = false;
+        if !first.is_empty() {
+            processor.advance(&mut *term, &first);
+            changed = true;
+        }
+        while let Ok(bytes) = self.byte_rx.try_recv() {
+            if !bytes.is_empty() {
+                processor.advance(&mut *term, &bytes);
+                changed = true;
+            }
+        }
+        Some(changed)
+    }
+
     /// Process bytes through Osc133Parser and VTE, updating shell markers and phase.
     /// Processes byte-by-byte so cursor position is correct when each OSC 133 marker is received.
     pub fn advance_with_osc133(&self) {
@@ -136,7 +179,9 @@ impl TerminalEngine {
     }
 
     /// Get renderable content for frame loop rendering.
-    /// Calls `f` with (content, display_iter, screen_lines). Use the iterator for cells; content provides colors and cursor.
+    /// Calls `f` with (content, display_iter, screen_lines, cols, display_offset).
+    /// Use the iterator for cells; content provides colors and cursor.
+    /// display_offset is for viewport culling: visible_line = grid_line - display_offset.
     /// Uses try_lock() to avoid blocking - returns None if terminal is busy.
     pub fn try_renderable_content<F, R>(&self, f: F) -> Option<R>
     where
@@ -144,17 +189,21 @@ impl TerminalEngine {
             &alacritty_terminal::term::RenderableContent<'_>,
             alacritty_terminal::grid::GridIterator<'_, Cell>,
             usize,
+            usize,
+            usize,
         ) -> R,
     {
         let Ok(term) = self.terminal.try_lock() else {
             return None; // Terminal locked by advance_bytes thread
         };
 
+        let grid = term.grid();
         let content = term.renderable_content();
-
-        let display_iter = term.grid().display_iter();
-        let screen_lines = term.grid().screen_lines();
-        Some(f(&content, display_iter, screen_lines))
+        let display_iter = grid.display_iter();
+        let screen_lines = grid.screen_lines();
+        let cols = grid.columns();
+        let display_offset = grid.display_offset();
+        Some(f(&content, display_iter, screen_lines, cols, display_offset))
     }
 
     /// Returns true when a TUI app (vim, neovim, Claude Code, etc.) is active.

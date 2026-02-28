@@ -31,16 +31,25 @@
 |------|------|------|
 | [2026-02-28-p1-config-backend.md](2026-02-28-p1-config-backend.md) | config.json 支持 backend；env 覆盖 config；StatusBar 展示；加载时校验 | ~1 天 |
 
+## Remote Channels
+
+| 计划 | 目标 | 预估 |
+|------|------|------|
+| [2026-02-28-remote-channels.md](2026-02-28-remote-channels.md) | Discord/KOOK 推送 Agent 状态与告警；secrets.json；遥控命令（Phase C） | Phase A 1~2 天 |
+
 ## UI 性能
 
 | 计划 | 目标 | 预估 |
 |------|------|------|
 | [2026-02-28-ui-performance-ultimate.md](2026-02-28-ui-performance-ultimate.md) | 界面性能终极方案：worktree 缓存、切换异步化、细粒度重绘、渲染瘦身 | 4~6 天 |
 | [2026-02-28-terminal-element-implementation.md](2026-02-28-terminal-element-implementation.md) | TerminalElement 完全重构（Zed 参考）：paint_quad + shape_line，cursor/resize，完整测试 | 8~12 天 |
+| [2026-02-28-route-b-entity-split-implementation.md](2026-02-28-route-b-entity-split-implementation.md) | **路线 B**：Zed 风格 Entity 拆分，TopBar/Sidebar 等独立 Model+Entity，细粒度 notify | ~3 天 |
 
 **依赖顺序**：Phase 1（worktree 缓存）→ Phase 2（切换异步化）→ Phase 3~5
 
 **TerminalElement**：参考 [2026-02-28-terminal-element-brainstorm.md](2026-02-28-terminal-element-brainstorm.md)
+
+**路线 B**：参考 [2026-02-28-route-b-zed-style-entity-split-brainstorm.md](2026-02-28-route-b-zed-style-entity-split-brainstorm.md)
 
 ## 历史计划
 

@@ -12,7 +12,8 @@ use std::thread;
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 
 use crate::runtime::agent_runtime::{AgentId, AgentRuntime, PaneId, RuntimeError};
-/// Single pane PTY instance.
+/// Single pane PTY instance. (WIP: multi-pane support)
+#[allow(dead_code)]
 struct LocalPtyPane {
     pane_id: PaneId,
     master: Mutex<Box<dyn portable_pty::MasterPty + Send>>,
@@ -39,7 +40,8 @@ pub struct LocalPtyRuntime {
 }
 
 /// Local PTY Agent - manages multiple panes for a single worktree.
-/// Each pane has its own PTY and shell process.
+/// Each pane has its own PTY and shell process. (WIP: not yet integrated)
+#[allow(dead_code)]
 pub struct LocalPtyAgent {
     worktree_path: std::path::PathBuf,
     panes: Mutex<HashMap<PaneId, Arc<LocalPtyPane>>>,
@@ -48,6 +50,7 @@ pub struct LocalPtyAgent {
     rows: u16,
 }
 
+#[allow(dead_code)]
 impl LocalPtyAgent {
     /// Create a new LocalPtyAgent for the given worktree.
     /// Initializes with a single primary pane.
@@ -249,7 +252,7 @@ impl AgentRuntime for LocalPtyAgent {
         }
     }
 
-    fn open_diff(&self, worktree: &Path, pane_id: Option<&PaneId>) -> Result<String, RuntimeError> {
+    fn open_diff(&self, _worktree: &Path, pane_id: Option<&PaneId>) -> Result<String, RuntimeError> {
         // Get the target pane or primary pane
         let target_pane_id = pane_id
             .map(|p| p.to_string())
@@ -381,12 +384,30 @@ impl AgentRuntime for LocalPtyRuntime {
     }
 
     fn send_input(&self, pane_id: &PaneId, bytes: &[u8]) -> Result<(), RuntimeError> {
+        // #region agent log
+        crate::debug_log::dbg_log(
+            "local_pty.rs:send_input",
+            "entry",
+            &serde_json::json!({"bytes_len": bytes.len(), "pane_match": pane_id == &self.pane_id}),
+            "H4",
+        );
+        // #endregion
         if pane_id != &self.pane_id {
             return Err(RuntimeError::PaneNotFound(pane_id.clone()));
         }
-        self.input_tx
+        let result = self
+            .input_tx
             .send(bytes.to_vec())
-            .map_err(|e| RuntimeError::Backend(e.to_string()))
+            .map_err(|e| RuntimeError::Backend(e.to_string()));
+        // #region agent log
+        crate::debug_log::dbg_log(
+            "local_pty.rs:send_input",
+            "exit",
+            &serde_json::json!({"ok": result.is_ok()}),
+            "H4",
+        );
+        // #endregion
+        result
     }
 
     fn send_key(
@@ -408,7 +429,7 @@ impl AgentRuntime for LocalPtyRuntime {
             .master
             .lock()
             .map_err(|e| RuntimeError::Backend(e.to_string()))?;
-        guard
+        let _ = guard
             .resize(PtySize {
                 rows,
                 cols,

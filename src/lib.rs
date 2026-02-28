@@ -1,6 +1,7 @@
 // pmux library
 #![recursion_limit = "8192"]
 pub mod agent_status;
+mod debug_log;
 pub mod app_state;
 pub mod config;
 pub mod deps;

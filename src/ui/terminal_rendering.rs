@@ -86,19 +86,9 @@ where
     let mut current_fg: Option<Rgb> = None;
     let mut current_bg: Option<Rgb> = None;
     let mut current_flags: Option<Flags> = None;
-    let mut cell_idx: usize = 0;
-    let mut skipped_wide_spacer: usize = 0;
-
     for indexed in cells {
         let is_wide_spacer = indexed.cell.flags.contains(Flags::WIDE_CHAR_SPACER);
         if is_wide_spacer {
-            skipped_wide_spacer += 1;
-            // #region agent log
-            let _ = std::fs::OpenOptions::new().create(true).append(true).open("/Users/matt.chow/workspace/pmux/.cursor/debug-12d1c8.log").and_then(|mut f| {
-                use std::io::Write;
-                writeln!(f, "{{\"sessionId\":\"12d1c8\",\"id\":\"log_{}_spacer{}\",\"timestamp\":{},\"location\":\"terminal_rendering.rs:93\",\"message\":\"WIDE_CHAR_SPACER skipped\",\"data\":{{\"cell_idx\":{},\"line\":{},\"column\":{},\"char\":\"{}\",\"hypothesis\":\"D\"}},\"runId\":\"debug1\",\"hypothesisId\":\"D\"}}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis(), cell_idx, std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis(), cell_idx, indexed.point.line.0, indexed.point.column.0, indexed.cell.c)
-            });
-            // #endregion
             continue;
         }
 
@@ -110,7 +100,6 @@ where
             && current_bg.as_ref() == Some(&bg)
             && current_flags == Some(flags);
 
-        cell_idx += 1;
         if style_matches {
             current_text.push(indexed.cell.c);
         } else {
@@ -325,29 +314,10 @@ pub fn render_batch_row(
     let mut elements: Vec<AnyElement> = Vec::new();
     let mut acc: usize = 0;
     let mut cursor_inserted = false;
-    // #region agent log
-    let _ = std::fs::OpenOptions::new().create(true).append(true).open("/Users/matt.chow/workspace/pmux/.cursor/debug-12d1c8.log").and_then(|mut f| {
-        use std::io::Write;
-        writeln!(f, "{{\"sessionId\":\"12d1c8\",\"id\":\"log_{}_start\",\"timestamp\":{},\"location\":\"terminal_rendering.rs:313\",\"message\":\"render_batch_row start\",\"data\":{{\"cursor_col\":{},\"segment_count\":{},\"hypothesis\":\"A\"}},\"runId\":\"debug1\",\"hypothesisId\":\"A\"}}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis(), cursor_col, segments.len())
-    });
-    // #endregion
 
-    for (seg_idx, seg) in segments.iter().enumerate() {
+    for (_seg_idx, seg) in segments.iter().enumerate() {
         let len = seg.text.chars().count();
-        let text_preview: String = seg.text.chars().take(20).collect();
-        // #region agent log
-        let _ = std::fs::OpenOptions::new().create(true).append(true).open("/Users/matt.chow/workspace/pmux/.cursor/debug-12d1c8.log").and_then(|mut f| {
-            use std::io::Write;
-            writeln!(f, "{{\"sessionId\":\"12d1c8\",\"id\":\"log_{}_seg{}\",\"timestamp\":{},\"location\":\"terminal_rendering.rs:325\",\"message\":\"segment info\",\"data\":{{\"seg_idx\":{},\"text\":\"{}\",\"len_chars\":{},\"acc_before\":{},\"cursor_col\":{},\"hypothesis\":\"A\"}},\"runId\":\"debug1\",\"hypothesisId\":\"A\"}}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis(), seg_idx, std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis(), seg_idx, text_preview.replace("\\", "\\\\").replace("\"", "\\\""), len, acc, cursor_col)
-        });
-        // #endregion
         if !cursor_inserted && cursor_col <= acc {
-            // #region agent log
-            let _ = std::fs::OpenOptions::new().create(true).append(true).open("/Users/matt.chow/workspace/pmux/.cursor/debug-12d1c8.log").and_then(|mut f| {
-                use std::io::Write;
-                writeln!(f, "{{\"sessionId\":\"12d1c8\",\"id\":\"log_{}_insert1\",\"timestamp\":{},\"location\":\"terminal_rendering.rs:320\",\"message\":\"cursor inserted at boundary\",\"data\":{{\"cursor_col\":{},\"acc\":{},\"seg_idx\":{},\"hypothesis\":\"B\"}},\"runId\":\"debug1\",\"hypothesisId\":\"B\"}}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis(), cursor_col, acc, seg_idx)
-            });
-            // #endregion
             elements.push(cursor_el());
             cursor_inserted = true;
         }
@@ -355,12 +325,6 @@ pub fn render_batch_row(
             let offset = cursor_col - acc;
             let char_offset = seg.text.char_indices().nth(offset).map(|(i, _)| i).unwrap_or(seg.text.len());
             let (before, after) = seg.text.split_at(char_offset);
-            // #region agent log
-            let _ = std::fs::OpenOptions::new().create(true).append(true).open("/Users/matt.chow/workspace/pmux/.cursor/debug-12d1c8.log").and_then(|mut f| {
-                use std::io::Write;
-                writeln!(f, "{{\"sessionId\":\"12d1c8\",\"id\":\"log_{}_insert2\",\"timestamp\":{},\"location\":\"terminal_rendering.rs:335\",\"message\":\"cursor inserted inside segment\",\"data\":{{\"cursor_col\":{},\"acc\":{},\"len\":{},\"offset\":{},\"char_offset\":{},\"seg_idx\":{},\"before\":\"{}\",\"after\":\"{}\",\"hypothesis\":\"A\"}},\"runId\":\"debug1\",\"hypothesisId\":\"A\"}}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis(), cursor_col, acc, len, offset, char_offset, seg_idx, before.replace("\\", "\\\\").replace("\"", "\\\""), after.replace("\\", "\\\\").replace("\"", "\\\""))
-            });
-            // #endregion
             if !before.is_empty() {
                 elements.push(segment_to_element(&StyledSegment {
                     text: before.to_string(),
@@ -386,12 +350,6 @@ pub fn render_batch_row(
     }
 
     if !cursor_inserted && cursor_col >= acc {
-        // #region agent log
-        let _ = std::fs::OpenOptions::new().create(true).append(true).open("/Users/matt.chow/workspace/pmux/.cursor/debug-12d1c8.log").and_then(|mut f| {
-            use std::io::Write;
-            writeln!(f, "{{\"sessionId\":\"12d1c8\",\"id\":\"log_{}_insert3\",\"timestamp\":{},\"location\":\"terminal_rendering.rs:360\",\"message\":\"cursor inserted at end\",\"data\":{{\"cursor_col\":{},\"acc\":{},\"hypothesis\":\"B\"}},\"runId\":\"debug1\",\"hypothesisId\":\"B\"}}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis(), cursor_col, acc)
-        });
-        // #endregion
         elements.push(cursor_el());
     }
 

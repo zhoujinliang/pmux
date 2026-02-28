@@ -16,12 +16,17 @@ pub struct RemoteChannelsConfig {
     pub discord: DiscordChannelConfig,
     #[serde(default)]
     pub kook: KookChannelConfig,
+    #[serde(default)]
+    pub feishu: FeishuChannelConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DiscordChannelConfig {
     #[serde(default)]
     pub enabled: bool,
+    /// Discord channel ID for sending and receiving (required when enabled)
+    #[serde(default)]
+    pub channel_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -34,7 +39,10 @@ pub struct KookChannelConfig {
 
 impl Default for DiscordChannelConfig {
     fn default() -> Self {
-        Self { enabled: false }
+        Self {
+            enabled: false,
+            channel_id: None,
+        }
     }
 }
 
@@ -43,6 +51,24 @@ impl Default for KookChannelConfig {
         Self {
             enabled: false,
             channel_id: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FeishuChannelConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Feishu group chat ID (receive_id, chat_id)
+    #[serde(default)]
+    pub chat_id: Option<String>,
+}
+
+impl Default for FeishuChannelConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            chat_id: None,
         }
     }
 }
@@ -401,19 +427,21 @@ mod tests {
         assert_eq!(config.backend, "tmux");
     }
 
-    /// Test: remote_channels loads discord.enabled and kook.channel_id from JSON
+    /// Test: remote_channels loads discord.enabled, kook.channel_id, feishu.chat_id from JSON
     #[test]
     fn test_config_remote_channels() {
         let temp = TempDir::new().unwrap();
         let path = temp.path().join("config.json");
         std::fs::write(
             &path,
-            r#"{"remote_channels":{"discord":{"enabled":true},"kook":{"enabled":true,"channel_id":"123"}}}"#,
+            r#"{"remote_channels":{"discord":{"enabled":true},"kook":{"enabled":true,"channel_id":"123"},"feishu":{"enabled":true,"chat_id":"oc_abc"}}}"#,
         )
         .unwrap();
         let config = Config::load_from_path(&path).unwrap();
         assert!(config.remote_channels.discord.enabled);
         assert_eq!(config.remote_channels.kook.channel_id.as_deref(), Some("123"));
+        assert!(config.remote_channels.feishu.enabled);
+        assert_eq!(config.remote_channels.feishu.chat_id.as_deref(), Some("oc_abc"));
     }
 
     /// Test: migrate_from_legacy populates workspace_paths from recent_workspace

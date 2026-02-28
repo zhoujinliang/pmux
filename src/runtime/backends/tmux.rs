@@ -385,7 +385,10 @@ impl AgentRuntime for TmuxRuntime {
 
     fn focus_pane(&self, pane_id: &PaneId) -> Result<(), RuntimeError> {
         let target = self.pane_target(pane_id);
-        self.tmux_cmd(&["select-pane", "-t", &target])
+        self.tmux_cmd(&["select-pane", "-t", &target])?;
+        // PTY prewarm: send empty bytes to populate cache so first real keystroke hits cache (avoids 50–100ms tmux display -p on first input)
+        let _ = self.input_tx.send((pane_id.clone(), vec![]));
+        Ok(())
     }
 
     fn split_pane(&self, pane_id: &PaneId, vertical: bool) -> Result<PaneId, RuntimeError> {

@@ -51,7 +51,7 @@ pub fn session_name_for_workspace(workspace_path: &Path) -> String {
 
 /// Window naming for tmux backend. One worktree/agent = one window.
 /// Main worktree -> "main"; linked worktrees -> sanitized branch name.
-pub fn window_name_for_worktree(worktree_path: &Path, branch_name: &str) -> String {
+pub fn window_name_for_worktree(_worktree_path: &Path, branch_name: &str) -> String {
     let name = if branch_name.is_empty() || branch_name == "main" {
         "main".to_string()
     } else {

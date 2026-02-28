@@ -1,7 +1,8 @@
 // ui/app_root.rs - Root component for pmux GUI
 use crate::agent_status::{StatusCounts, AgentStatus};
 use crate::config::Config;
-use crate::remotes::RemoteChannelPublisher;
+use crate::remotes::{RemoteChannelPublisher, spawn_remote_gateways};
+use crate::remotes::secrets::Secrets;
 use crate::deps::{self, DependencyCheckResult};
 use crate::file_selector::show_folder_picker_async;
 use crate::git_utils::{is_git_repository, get_git_error_message, GitError};
@@ -23,9 +24,16 @@ use gpui::prelude::FluentBuilder;
 use gpui::*;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant, UNIX_EPOCH};
+use futures_util::select;
+use futures_util::future::FutureExt;
 use tokio::sync::broadcast;
+
+/// When true, AppRoot will set show_settings=true and clear this flag at start of render.
+/// Used by menu action (open_settings) to open Settings from main.rs without window access.
+pub static OPEN_SETTINGS_REQUESTED: AtomicBool = AtomicBool::new(false);
 
 /// Notification sender that forwards to AppRoot's NotificationManager
 struct AppNotificationSender {
@@ -108,6 +116,14 @@ pub struct AppRoot {
     /// ResizeController: debounced window bounds → (cols, rows) for engine/runtime resize.
     /// Resize is driven here, NOT by TerminalElement/TerminalView request_layout/prepaint/paint.
     resize_controller: ResizeController,
+    /// When true, show the Settings modal overlay
+    show_settings: bool,
+    /// Draft config when Settings is open; None when closed. Updated on open and by toggles.
+    settings_draft: Option<Config>,
+    /// Draft secrets when Settings is open; None when closed.
+    settings_secrets_draft: Option<Secrets>,
+    /// Which channel config panel is open: "discord", "kook", "feishu"
+    settings_configuring_channel: Option<String>,
 }
 
 impl AppRoot {
@@ -216,6 +232,10 @@ impl AppRoot {
             terminal_needs_focus: false,
             terminal_focus: None,
             resize_controller: ResizeController::new(),
+            show_settings: false,
+            settings_draft: None,
+            settings_secrets_draft: None,
+            settings_configuring_channel: None,
         }
     }
 
@@ -287,51 +307,82 @@ impl AppRoot {
                 buffers.insert(pane_target.to_string(), buffer);
             }
 
-            // Clone for status detection
+            // Dedicated std::thread for PTY recv — no blocking::unblock/thread-pool scheduling delay
+            let (dirty_tx, dirty_rx) = flume::unbounded::<()>();
+            let engine_thread = engine.clone();
+            std::thread::spawn(move || {
+                const OUTPUT_POLL_MS: u64 = 4;
+                loop {
+                    match engine_thread.advance_bytes_with_timeout(Duration::from_millis(OUTPUT_POLL_MS)) {
+                        Some(true) => {
+                            let _ = dirty_tx.send(());
+                        }
+                        Some(false) => {
+                            // Lock contention: send dirty to ensure render continues
+                            let _ = dirty_tx.send(());
+                        }
+                        None => break,
+                    }
+                }
+            });
+
             let status_publisher = self.status_publisher.clone();
             let pane_target_clone = pane_target.to_string();
-
+            let has_pending = Arc::new(AtomicBool::new(false));
+            let has_pending_clone = has_pending.clone();
+            let last_notify_ms = Arc::new(AtomicU64::new(0));
+            let last_notify_ms_clone = last_notify_ms.clone();
             let _entity = cx.entity();
             cx.spawn(async move |entity, cx| {
-                loop {
-                    // Use 16ms for ~60fps input polling
-                    blocking::unblock(|| std::thread::sleep(Duration::from_millis(16))).await;
-
-                    // Process new terminal bytes
-                    let content_changed = engine.advance_bytes();
-
-                    // Event-driven status detection (no polling loop)
-                    // Check status whenever terminal content changes
-                    if let Some(ref pub_) = status_publisher {
-                        // Get shell phase info from OSC 133 markers (if available)
-                        let shell_info = crate::shell_integration::ShellPhaseInfo {
-                            phase: engine.shell_phase(),
-                            last_post_exec_exit_code: engine.last_post_exec_exit_code(),
-                        };
-
-                        // Get terminal content for text-based detection
-                        let content: Option<String> = entity.update(cx, |this, _cx| {
-                            if let Ok(buffers) = this.terminal_buffers.lock() {
-                                if let Some(buffer) = buffers.get(&pane_target_clone) {
-                                    return buffer.content_for_status_detection();
+                const THROTTLE_MS: u64 = 16;
+                macro_rules! do_notify {
+                    () => {
+                        if let Some(ref pub_) = status_publisher {
+                            let shell_info = crate::shell_integration::ShellPhaseInfo {
+                                phase: engine.shell_phase(),
+                                last_post_exec_exit_code: engine.last_post_exec_exit_code(),
+                            };
+                            let content: Option<String> = entity.update(cx, |this, _cx| {
+                                if let Ok(buffers) = this.terminal_buffers.lock() {
+                                    if let Some(buffer) = buffers.get(&pane_target_clone) {
+                                        return buffer.content_for_status_detection();
+                                    }
                                 }
+                                None
+                            }).ok().flatten();
+                            if let Some(content_str) = content {
+                                let _ = pub_.check_status(
+                                    &pane_target_clone,
+                                    crate::status_detector::ProcessStatus::Running,
+                                    Some(shell_info),
+                                    &content_str,
+                                );
                             }
-                            None
-                        }).ok().flatten();
-
-                        // Detect and publish status if changed
-                        if let Some(content_str) = content {
-                            let _ = pub_.check_status(
-                                &pane_target_clone,
-                                crate::status_detector::ProcessStatus::Running,
-                                Some(shell_info),
-                                &content_str,
-                            );
                         }
-                    }
-
-                    if content_changed && entity.update(cx, |_, cx| cx.notify()).is_err() {
-                        break;
+                        let _ = entity.update(cx, |_, cx| cx.notify());
+                        last_notify_ms_clone.store(
+                            std::time::SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64,
+                            Ordering::SeqCst,
+                        );
+                    };
+                }
+                loop {
+                    select! {
+                        result = dirty_rx.recv_async().fuse() => {
+                            if result.is_err() { break; }
+                            has_pending_clone.store(true, Ordering::SeqCst);
+                            while dirty_rx.try_recv().is_ok() {}
+                            let now_ms = std::time::SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
+                            if now_ms.saturating_sub(last_notify_ms_clone.load(Ordering::SeqCst)) >= THROTTLE_MS {
+                                has_pending_clone.store(false, Ordering::SeqCst);
+                                do_notify!();
+                            }
+                        }
+                        _ = cx.background_executor().timer(Duration::from_millis(THROTTLE_MS)).fuse() => {
+                            if has_pending_clone.swap(false, Ordering::SeqCst) {
+                                do_notify!();
+                            }
+                        }
                     }
                 }
             })
@@ -366,40 +417,81 @@ impl AppRoot {
                 buffers.insert(pane_target.to_string(), buffer);
             }
 
+            let (dirty_tx, dirty_rx) = flume::unbounded::<()>();
+            let engine_thread = engine.clone();
+            std::thread::spawn(move || {
+                const OUTPUT_POLL_MS: u64 = 4;
+                loop {
+                    match engine_thread.advance_bytes_with_timeout(Duration::from_millis(OUTPUT_POLL_MS)) {
+                        Some(true) => {
+                            let _ = dirty_tx.send(());
+                        }
+                        Some(false) => {
+                            // Lock contention: send dirty to ensure render continues
+                            let _ = dirty_tx.send(());
+                        }
+                        None => break,
+                    }
+                }
+            });
+
             let status_publisher = self.status_publisher.clone();
             let pane_target_clone = pane_target.to_string();
+            let has_pending = Arc::new(AtomicBool::new(false));
+            let has_pending_clone = has_pending.clone();
+            let last_notify_ms = Arc::new(AtomicU64::new(0));
+            let last_notify_ms_clone = last_notify_ms.clone();
             let _entity = cx.entity();
             cx.spawn(async move |entity, cx| {
-                loop {
-                    blocking::unblock(|| std::thread::sleep(Duration::from_millis(16))).await;
-                    let content_changed = engine.advance_bytes();
-                    if let Some(ref pub_) = status_publisher {
-                        let shell_info = crate::shell_integration::ShellPhaseInfo {
-                            phase: engine.shell_phase(),
-                            last_post_exec_exit_code: engine.last_post_exec_exit_code(),
-                        };
-                        let content: Option<String> = entity
-                            .update(cx, |this, _cx| {
+                const THROTTLE_MS: u64 = 16;
+                macro_rules! do_notify {
+                    () => {
+                        if let Some(ref pub_) = status_publisher {
+                            let shell_info = crate::shell_integration::ShellPhaseInfo {
+                                phase: engine.shell_phase(),
+                                last_post_exec_exit_code: engine.last_post_exec_exit_code(),
+                            };
+                            let content: Option<String> = entity.update(cx, |this, _cx| {
                                 if let Ok(buffers) = this.terminal_buffers.lock() {
                                     if let Some(buffer) = buffers.get(&pane_target_clone) {
                                         return buffer.content_for_status_detection();
                                     }
                                 }
                                 None
-                            })
-                            .ok()
-                            .flatten();
-                        if let Some(content_str) = content {
-                            let _ = pub_.check_status(
-                                &pane_target_clone,
-                                crate::status_detector::ProcessStatus::Running,
-                                Some(shell_info),
-                                &content_str,
-                            );
+                            }).ok().flatten();
+                            if let Some(content_str) = content {
+                                let _ = pub_.check_status(
+                                    &pane_target_clone,
+                                    crate::status_detector::ProcessStatus::Running,
+                                    Some(shell_info),
+                                    &content_str,
+                                );
+                            }
                         }
-                    }
-                    if content_changed && entity.update(cx, |_, cx| cx.notify()).is_err() {
-                        break;
+                        let _ = entity.update(cx, |_, cx| cx.notify());
+                        last_notify_ms_clone.store(
+                            std::time::SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64,
+                            Ordering::SeqCst,
+                        );
+                    };
+                }
+                loop {
+                    select! {
+                        result = dirty_rx.recv_async().fuse() => {
+                            if result.is_err() { break; }
+                            has_pending_clone.store(true, Ordering::SeqCst);
+                            while dirty_rx.try_recv().is_ok() {}
+                            let now_ms = std::time::SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
+                            if now_ms.saturating_sub(last_notify_ms_clone.load(Ordering::SeqCst)) >= THROTTLE_MS {
+                                has_pending_clone.store(false, Ordering::SeqCst);
+                                do_notify!();
+                            }
+                        }
+                        _ = cx.background_executor().timer(Duration::from_millis(THROTTLE_MS)).fuse() => {
+                            if has_pending_clone.swap(false, Ordering::SeqCst) {
+                                do_notify!();
+                            }
+                        }
                     }
                 }
             })
@@ -761,6 +853,7 @@ impl AppRoot {
         let remote_rx = event_bus.subscribe();
         let config = Config::load().unwrap_or_default();
         let secrets = crate::remotes::Secrets::load().unwrap_or_default();
+        spawn_remote_gateways(&config, &secrets);
         let publisher = RemoteChannelPublisher::from_config(&config, &secrets);
         if publisher.has_channels() {
             publisher.run(remote_rx);
@@ -934,7 +1027,6 @@ impl AppRoot {
             .map(|t| t.path.clone())
             .unwrap_or_else(|| repo_path.clone());
         let config = Config::load().ok();
-        let entity = cx.entity();
         cx.spawn(async move |entity, cx| {
             let path_clone = path.clone();
             let branch_clone = branch.clone();
@@ -1024,6 +1116,20 @@ impl AppRoot {
 
     /// Handle keyboard events
     fn handle_key_down(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        // #region agent log
+        crate::debug_log::dbg_log(
+            "app_root.rs:handle_key_down",
+            "key_down entry",
+            &serde_json::json!({
+                "key": event.keystroke.key,
+                "platform": event.keystroke.modifiers.platform,
+                "has_runtime": self.runtime.is_some(),
+                "has_target": self.active_pane_target.is_some(),
+                "target": self.active_pane_target.as_deref().unwrap_or("")
+            }),
+            "H1",
+        );
+        // #endregion
         // Check for Alt+Cmd+arrows (pane focus switch)
         if event.keystroke.modifiers.platform && event.keystroke.modifiers.alt {
             let pane_count = self.split_tree.pane_count();
@@ -1102,8 +1208,7 @@ impl AppRoot {
         }
 
         // Forward all other keys to terminal via Runtime (xterm escape sequences)
-        // Offload send_input to background task - never block UI thread on I/O
-        let send_target = self.active_pane_target.as_deref();
+        // Zed-style: synchronous channel send (writer thread does PTY write), no spawn/blocking
         let key_name = event.keystroke.key.clone();
         let modifiers = KeyModifiers {
             platform: event.keystroke.modifiers.platform,
@@ -1111,28 +1216,58 @@ impl AppRoot {
             alt: event.keystroke.modifiers.alt,
             ctrl: event.keystroke.modifiers.control,
         };
-        match (&self.runtime, send_target) {
+        match (&self.runtime, self.active_pane_target.as_ref()) {
             (Some(runtime), Some(target)) => {
-                if let Some(bytes) = key_to_xterm_escape(&key_name, modifiers) {
-                    let rt = runtime.clone();
-                    let target = target.to_string();
-                    let bytes = bytes.to_vec();
-                    cx.spawn(async move |_entity, _cx| {
-                        let result = blocking::unblock(move || rt.send_input(&target, &bytes)).await;
-                        if let Err(e) = result {
-                            eprintln!("pmux: send_input failed: {}", e);
-                        }
-                    })
-                    .detach();
+                let bytes_opt = key_to_xterm_escape(&key_name, modifiers);
+                // #region agent log
+                crate::debug_log::dbg_log(
+                    "app_root.rs:handle_key_down",
+                    "after key_to_xterm",
+                    &serde_json::json!({
+                        "key": key_name,
+                        "got_bytes": bytes_opt.is_some(),
+                        "bytes_len": bytes_opt.as_ref().map(|b| b.len())
+                    }),
+                    "H2",
+                );
+                // #endregion
+                if let Some(bytes) = bytes_opt {
+                    let send_result = runtime.send_input(target, &bytes);
+                    // #region agent log
+                    crate::debug_log::dbg_log(
+                        "app_root.rs:handle_key_down",
+                        "after send_input",
+                        &serde_json::json!({
+                            "send_ok": send_result.is_ok(),
+                            "backend": runtime.backend_type()
+                        }),
+                        "H4",
+                    );
+                    // #endregion
+                    if let Err(e) = send_result {
+                        eprintln!("pmux: send_input failed: {}", e);
+                    }
                 }
             }
             _ => {
+                // #region agent log
+                crate::debug_log::dbg_log(
+                    "app_root.rs:handle_key_down",
+                    "no forward branch",
+                    &serde_json::json!({
+                        "key": key_name,
+                        "platform": modifiers.platform,
+                        "reason": if self.runtime.is_none() { "no_runtime" } else { "no_target" }
+                    }),
+                    "H2",
+                );
+                // #endregion
                 if !modifiers.platform {
                     eprintln!(
                         "pmux: key '{}' not forwarded (runtime={} target={})",
                         key_name,
                         self.runtime.is_some(),
-                        send_target.unwrap_or("none")
+                        self.active_pane_target.as_deref().unwrap_or("none")
                     );
                 }
             }
@@ -1459,6 +1594,107 @@ impl AppRoot {
             }
         }
         cx.notify();
+    }
+
+    fn settings_channel_card_el<F>(
+        name: &str,
+        channel_key: &str,
+        status: &str,
+        enabled: bool,
+        entity: Entity<Self>,
+        on_toggle: F,
+    ) -> impl IntoElement
+    where
+        F: Fn(&mut Config) + Send + 'static,
+    {
+        let name_owned = name.to_string();
+        let status_owned = status.to_string();
+        let name_ss = SharedString::from(name_owned.clone());
+        let status_ss = SharedString::from(status_owned.clone());
+        let entity_for_toggle = entity.clone();
+        let entity_for_config = entity.clone();
+        let toggle = div()
+            .id(format!("settings-toggle-{}", name_owned))
+            .w(px(40.))
+            .h(px(22.))
+            .rounded(px(11.))
+            .flex()
+            .items_center()
+            .px(px(2.))
+            .cursor_pointer()
+            .bg(if enabled { rgb(0x0066cc) } else { rgb(0x4a4a4a) })
+            .on_click(move |_event, _window, cx| {
+                let _ = cx.update_entity(&entity_for_toggle, |this: &mut AppRoot, cx| {
+                    if let Some(ref mut draft) = this.settings_draft {
+                        on_toggle(draft);
+                    }
+                    cx.notify();
+                });
+            })
+            .child(
+                div()
+                    .w(px(18.))
+                    .h(px(18.))
+                    .rounded(px(9.))
+                    .bg(rgb(0xffffff))
+                    .ml(if enabled { px(18.) } else { px(0.) })
+            );
+        let channel_key_owned = channel_key.to_string();
+        let config_btn = div()
+            .id(format!("settings-config-{}", name_owned))
+            .px(px(12.))
+            .py(px(6.))
+            .rounded(px(4.))
+            .bg(rgb(0x3d3d3d))
+            .text_color(rgb(0xcccccc))
+            .text_size(px(12.))
+            .font_weight(FontWeight::MEDIUM)
+            .cursor_pointer()
+            .hover(|style: StyleRefinement| style.bg(rgb(0x4d4d4d)))
+            .on_click(move |_event, _window, cx| {
+                let _ = cx.update_entity(&entity_for_config, |this: &mut AppRoot, cx| {
+                    this.settings_configuring_channel = Some(channel_key_owned.clone());
+                    cx.notify();
+                });
+            })
+            .child("配置");
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .justify_between()
+            .gap(px(12.))
+            .p(px(12.))
+            .rounded(px(6.))
+            .bg(rgb(0x1e1e1e))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(4.))
+                    .child(
+                        div()
+                            .text_size(px(14.))
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(rgb(0xffffff))
+                            .child(name_ss)
+                    )
+                    .child(
+                        div()
+                            .text_size(px(12.))
+                            .text_color(rgb(0x888888))
+                            .child(status_ss)
+                    )
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(8.))
+                    .child(toggle)
+                    .child(config_btn)
+            )
     }
 
     fn render_dependency_check_page(
@@ -2048,6 +2284,26 @@ impl AppRoot {
 
 impl Render for AppRoot {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Open Settings when requested from menu (main.rs)
+        if OPEN_SETTINGS_REQUESTED.swap(false, Ordering::SeqCst) {
+            self.show_settings = true;
+            self.settings_draft = Config::load().ok();
+            self.settings_secrets_draft = Secrets::load().ok();
+        }
+
+        // #region agent log — render timing for bottleneck validation
+        let _render_timing = {
+            let start = Instant::now();
+            struct Guard(std::time::Instant);
+            impl Drop for Guard {
+                fn drop(&mut self) {
+                    let ms = self.0.elapsed().as_millis() as u64;
+                    crate::debug_log::dbg_render_sample(ms);
+                }
+            }
+            Guard(start)
+        };
+        // #endregion
         // Resize PTY and TermBridge via ResizeController (debounced, NOT in request_layout/prepaint/paint).
         // TerminalElement/TerminalView do NOT trigger resize.
         if self.has_workspaces() && !self.resize_controller.is_pending() {
@@ -2119,6 +2375,264 @@ impl Render for AppRoot {
                     self.render_startup_page(cx).into_any_element()
                 },
             )
+            .when(self.show_settings, |el| {
+                let app_root_entity = cx.entity();
+                let app_root_entity_for_close = app_root_entity.clone();
+                // Use draft or load on demand
+                let config = self.settings_draft.clone().unwrap_or_else(|| Config::load().unwrap_or_default());
+                let secrets = self.settings_secrets_draft.clone().unwrap_or_else(|| Secrets::load().unwrap_or_default());
+                let discord_configured = config.remote_channels.discord.channel_id.as_ref().map_or(false, |s: &String| !s.is_empty())
+                    && secrets.remote_channels.discord.bot_token.as_ref().map_or(false, |s: &String| !s.is_empty());
+                let kook_configured = config.remote_channels.kook.channel_id.as_ref().map_or(false, |s: &String| !s.is_empty())
+                    && secrets.remote_channels.kook.bot_token.as_ref().map_or(false, |s: &String| !s.is_empty());
+                let feishu_configured = config.remote_channels.feishu.chat_id.as_ref().map_or(false, |s: &String| !s.is_empty())
+                    && secrets.remote_channels.feishu.app_id.as_ref().map_or(false, |s: &String| !s.is_empty())
+                    && secrets.remote_channels.feishu.app_secret.as_ref().map_or(false, |s: &String| !s.is_empty());
+                let discord_enabled = config.remote_channels.discord.enabled;
+                let kook_enabled = config.remote_channels.kook.enabled;
+                let feishu_enabled = config.remote_channels.feishu.enabled;
+                let app_root_entity_discord = app_root_entity.clone();
+                let app_root_entity_kook = app_root_entity.clone();
+                let app_root_entity_feishu = app_root_entity.clone();
+                let app_root_entity_save = app_root_entity.clone();
+                let discord_status = if discord_configured { "已配置" } else { "未配置" };
+                let kook_status = if kook_configured { "已配置" } else { "未配置" };
+                let feishu_status = if feishu_configured { "已配置" } else { "未配置" };
+                let channel_cards = div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(12.))
+                    .child(Self::settings_channel_card_el(
+                        "Discord",
+                        "discord",
+                        discord_status,
+                        discord_enabled,
+                        app_root_entity_discord,
+                        |draft| {
+                            draft.remote_channels.discord.enabled = !draft.remote_channels.discord.enabled;
+                        },
+                    ))
+                    .child(Self::settings_channel_card_el(
+                        "KOOK",
+                        "kook",
+                        kook_status,
+                        kook_enabled,
+                        app_root_entity_kook,
+                        |draft| {
+                            draft.remote_channels.kook.enabled = !draft.remote_channels.kook.enabled;
+                        },
+                    ))
+                    .child(Self::settings_channel_card_el(
+                        "飞书",
+                        "feishu",
+                        feishu_status,
+                        feishu_enabled,
+                        app_root_entity_feishu,
+                        |draft| {
+                            draft.remote_channels.feishu.enabled = !draft.remote_channels.feishu.enabled;
+                        },
+                    ));
+                let save_button = div()
+                    .id("settings-save-btn")
+                    .px(px(16.))
+                    .py(px(8.))
+                    .rounded(px(6.))
+                    .bg(rgb(0x0066cc))
+                    .text_color(rgb(0xffffff))
+                    .text_size(px(14.))
+                    .font_weight(FontWeight::MEDIUM)
+                    .cursor_pointer()
+                    .hover(|style: StyleRefinement| style.bg(rgb(0x0077dd)))
+                    .on_click(move |_event, _window, cx| {
+                        let _ = cx.update_entity(&app_root_entity_save, |this: &mut AppRoot, cx| {
+                            if let Some(ref draft) = this.settings_draft {
+                                let mut current = Config::load().unwrap_or_default();
+                                current.remote_channels = draft.remote_channels.clone();
+                                let _ = current.save();
+                            }
+                            if let Some(ref secrets) = this.settings_secrets_draft {
+                                let _ = secrets.save();
+                            }
+                            this.show_settings = false;
+                            this.settings_draft = None;
+                            this.settings_secrets_draft = None;
+                            this.settings_configuring_channel = None;
+                            cx.notify();
+                        });
+                    })
+                    .child("Save");
+                let settings_content = div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(20.))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .justify_between()
+                            .child(
+                                div()
+                                    .text_size(px(18.))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(rgb(0xffffff))
+                                    .child("Settings")
+                            )
+                            .child(
+                                div()
+                                    .id("settings-close-btn")
+                                    .px(px(12.))
+                                    .py(px(6.))
+                                    .rounded(px(4.))
+                                    .bg(rgb(0x3d3d3d))
+                                    .text_color(rgb(0xcccccc))
+                                    .text_size(px(14.))
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .cursor_pointer()
+                                    .hover(|style: StyleRefinement| style.bg(rgb(0x4d4d4d)))
+                                    .on_click(move |_event, _window, cx| {
+                                        let _ = cx.update_entity(&app_root_entity_for_close, |this: &mut AppRoot, cx| {
+                                            this.show_settings = false;
+                                            this.settings_draft = None;
+                                            this.settings_secrets_draft = None;
+                                            this.settings_configuring_channel = None;
+                                            cx.notify();
+                                        });
+                                    })
+                                    .child("×")
+                            )
+                    )
+                    .child(channel_cards)
+                    .when(self.settings_configuring_channel.is_some(), |el| {
+                        let channel = self.settings_configuring_channel.as_ref().unwrap().clone();
+                        let (title, steps, url) = match channel.as_str() {
+                            "discord" => (
+                                "Discord 配置指南",
+                                "1. 创建应用并添加 Bot\n2. 复制 Bot Token 到 secrets.json 的 discord.bot_token\n3. 邀请 Bot 到服务器\n4. 开启开发者模式，右键频道复制 Channel ID 到 config.json",
+                                "https://discord.com/developers/applications",
+                            ),
+                            "kook" => (
+                                "KOOK 配置指南",
+                                "1. 创建应用并添加机器人\n2. 复制 Token 到 secrets.json 的 kook.bot_token\n3. 邀请机器人到服务器\n4. 获取频道 ID 填入 config.json 的 kook.channel_id",
+                                "https://developer.kookapp.cn/",
+                            ),
+                            "feishu" => (
+                                "飞书配置指南",
+                                "1. 创建企业自建应用\n2. 记录 App ID、App Secret 填入 secrets.json\n3. 开通「获取与发送群消息」权限\n4. 将 chat_id 填入 config.json 的 feishu.chat_id",
+                                "https://open.feishu.cn/",
+                            ),
+                            _ => ("配置", "", ""),
+                        };
+                        let app_root_entity_config = app_root_entity.clone();
+                        let url_owned = url.to_string();
+                        let open_btn = div()
+                            .px(px(12.))
+                            .py(px(8.))
+                            .rounded(px(6.))
+                            .bg(rgb(0x0066cc))
+                            .text_color(rgb(0xffffff))
+                            .text_size(px(12.))
+                            .font_weight(FontWeight::MEDIUM)
+                            .cursor_pointer()
+                            .hover(|s: StyleRefinement| s.bg(rgb(0x0077dd)))
+                            .on_mouse_down(gpui::MouseButton::Left, move |_event, _window, _cx| {
+                                let _ = open::that(&url_owned);
+                            })
+                            .child("在浏览器中打开");
+                        let done_btn = div()
+                            .px(px(12.))
+                            .py(px(8.))
+                            .rounded(px(6.))
+                            .bg(rgb(0x3d3d3d))
+                            .text_color(rgb(0xcccccc))
+                            .text_size(px(12.))
+                            .font_weight(FontWeight::MEDIUM)
+                            .cursor_pointer()
+                            .hover(|s: StyleRefinement| s.bg(rgb(0x4d4d4d)))
+                            .on_mouse_down(gpui::MouseButton::Left, move |_event, _window, cx| {
+                                let _ = cx.update_entity(&app_root_entity_config, |this: &mut AppRoot, cx| {
+                                    this.settings_configuring_channel = None;
+                                    cx.notify();
+                                });
+                            })
+                            .child("完成");
+                        el.child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap(px(12.))
+                                .p(px(16.))
+                                .rounded(px(6.))
+                                .bg(rgb(0x1e1e1e))
+                                .child(
+                                    div()
+                                        .text_size(px(14.))
+                                        .font_weight(FontWeight::MEDIUM)
+                                        .text_color(rgb(0xffffff))
+                                        .child(title)
+                                )
+                                .child(
+                                    div()
+                                        .text_size(px(12.))
+                                        .text_color(rgb(0xaaaaaa))
+                                        .whitespace_normal()
+                                        .child(steps)
+                                )
+                                .child(
+                                    div()
+                                        .flex()
+                                        .flex_row()
+                                        .gap(px(8.))
+                                        .child(open_btn)
+                                        .child(done_btn)
+                                )
+                        )
+                    })
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .justify_end()
+                            .child(save_button)
+                    );
+                let settings_card_with_content = div()
+                    .id("settings-dialog-card")
+                    .max_w(px(560.))
+                    .w_full()
+                    .flex()
+                    .flex_col()
+                    .gap(px(20.))
+                    .px(px(24.))
+                    .py(px(24.))
+                    .rounded(px(8.))
+                    .bg(rgb(0x2d2d2d))
+                    .shadow_lg()
+                    .on_click(|_event, _window, cx| {
+                        cx.stop_propagation();
+                    })
+                    .child(settings_content);
+                let settings_modal_with_content = div()
+                    .id("settings-modal-overlay")
+                    .absolute()
+                    .inset(px(0.))
+                    .size_full()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .bg(rgba(0x00000099u32))
+                    .cursor_pointer()
+                    .on_click(move |_event, _window, cx| {
+                        let _ = cx.update_entity(&app_root_entity, |this: &mut AppRoot, cx| {
+                            this.show_settings = false;
+                            this.settings_draft = None;
+                            this.settings_secrets_draft = None;
+                            this.settings_configuring_channel = None;
+                            cx.notify();
+                        });
+                    })
+                    .child(settings_card_with_content);
+                el.child(settings_modal_with_content)
+            })
     }
 }
 

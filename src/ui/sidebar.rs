@@ -619,7 +619,7 @@ impl RenderOnce for Sidebar {
             }).unwrap_or_else(|| (item_with_status.status_text().to_string(), "—".to_string()));
 
             let (add, del, files) = get_diff_stats(&item.info.path).unwrap_or((0, 0, 0));
-            let diff_str = format_diff_stats(add, del, files);
+            let _diff_str = format_diff_stats(add, del, files);
 
             let inner = div()
                 .flex().flex_col().gap(px(2.))

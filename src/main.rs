@@ -141,8 +141,9 @@ actions!(pmux_menus, [
     OpenHelp,
 ]);
 
-fn open_settings(_: &OpenSettings, _cx: &mut App) {
-    println!("Settings menu clicked - TODO: open settings UI");
+fn open_settings(_: &OpenSettings, cx: &mut App) {
+    pmux::ui::app_root::OPEN_SETTINGS_REQUESTED.store(true, std::sync::atomic::Ordering::SeqCst);
+    cx.activate(true);
 }
 
 fn select_workspace_from_menu(_: &SelectWorkspaceFromMenu, _cx: &mut App) {

@@ -41,6 +41,31 @@ GPU paint
 
 ---
 
+## 实施状态（截至 2026-02-28）
+
+| Task | 状态 | 说明 |
+|------|------|------|
+| Phase 1 骨架 / RowCache / ShapedLineCache | ✅ | build_frame、TerminalElement、layout_grid、RowCache、ShapedLineCache 接入 paint |
+| Phase 2.1 DisplayCursor / cursor_position | ✅ | DisplayCursor、cursor_position、cursor_width（grapheme fallback） |
+| **Phase 2.2 Cursor Shape** | ✅ | Block / Beam / Underline / HollowBlock / Hidden，来自 `content.cursor.shape` |
+| **Phase 2.3 DECTCEM** | ✅ | `shape == Hidden` 时不绘制，alacritty 在 `\x1b[?25l` 时设 shape=Hidden |
+| Phase 2.4 TUI 光标回归 | ⚠️ | `test_cursor_position_auto.sh` 存在，TUI vim + DECSCUSR 视觉回归待验证 |
+| **Phase 2.5 Tmux 坐标** | ❌ | LogicalCursor / VisualCursor / TmuxCursor 未实现；display_offset 与 tmux scroll 映射未处理 |
+| **Phase 3.0 ResizeController** | ✅ | `terminal_controller.rs`，maybe_resize、compute_dims、debounce；AppRoot 在 render 中调用 |
+| Phase 3.1 TerminalBounds | ✅ | `src/terminal/bounds.rs` |
+| **Phase 3.2 Local PTY Resize** | ✅ | `LocalPtyRuntime::resize` → `master.resize(PtySize)` |
+| **Phase 3.3 Tmux Resize** | ✅ | `TmuxRuntime::resize` → `tmux resize-pane -t ... -x -y` |
+| Phase 4 Viewport Culling | ⚠️ | 行级 culling 已做（build_frame），宽终端水平列裁剪未做 |
+| Phase 5 回归测试 | ⚠️ | 部分通过；gpui_macros SIGBUS 可能影响 `cargo test` |
+
+### 待完成
+
+1. **Task 2.5 Tmux cursor 坐标转换**：`display_offset` 与 tmux pane scroll 不一致时需 LogicalCursor ↔ TmuxCursor 转换，避免 vim 模式光标错位。
+2. **Task 4.1 宽终端列裁剪**：`visible_col_start..visible_col_end` 过滤，减少 200+ 列场景的 layout/paint。
+3. **Phase 2.4 TUI 回归**：vim + `\x1b[5 q` 等 DECSCUSR 视觉验证。
+
+---
+
 ## 数据流（关键约束）
 
 **⚠️ 必须引入 RenderableSnapshot 层，否则会遭遇 cursor jitter、layout/render 不一致、resize race。**

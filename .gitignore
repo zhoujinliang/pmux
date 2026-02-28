@@ -58,6 +58,7 @@ logs/
 # Local config (user-specific)
 config.json
 *.local.json
+secrets.json
 
 # Python venv for icon generation
 .venv-icon/

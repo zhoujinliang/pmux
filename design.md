@@ -90,6 +90,7 @@ UI 只依赖 Runtime API；Backend 可插拔，接入新 backend 无需改 UI。
 
 - `src/runtime/`：`agent_runtime.rs`、`pty_bridge.rs`
 - Event Bus：Agent 状态、Terminal 输出、通知
+- `src/remotes/`：Remote Channels（Discord、KOOK、飞书），见 §13
 
 ---
 
@@ -103,7 +104,7 @@ UI 只依赖 Runtime API；Backend 可插拔，接入新 backend 无需改 UI。
 |----------|------|--------|
 | `AgentStateChange` | Agent 状态变化（Running / Waiting / Error 等） | Sidebar、StatusBar |
 | `TerminalOutput` | 终端字节流 / Grid 更新，携带 `pane_id` | TerminalView |
-| `Notification` | 需提醒用户（等待输入、错误等） | Notification 面板、系统通知 |
+| `Notification` | 需提醒用户（等待输入、错误等） | Notification 面板、系统通知、RemoteChannels |
 
 实现：tokio `broadcast`（多订阅者）或 `mpsc`。Runtime 发布，UI 订阅。
 
@@ -228,7 +229,7 @@ Event Bus (subscribe)
        │
        ├─ AgentStateChange  → Sidebar 状态图标、StatusBar 聚合
        ├─ TerminalOutput    → TerminalView 渲染
-       └─ Notification     → 通知面板、系统 notify
+       └─ Notification     → 通知面板、系统 notify、RemoteChannels
        │
 用户操作（快捷键 / 点击）
        │
@@ -364,3 +365,170 @@ trait AgentRuntime {
 | **多 Pane 的 Runtime 抽象** | 每个 Pane 由 Agent 内部 Pane handle 管理，输出/输入都带 `pane_id`。UI 通过 Agent API 获取 pane 列表和状态。 |
 | **配置迁移** | config/state 新 schema 支持上述映射；提供迁移工具向后兼容老版本。 |
 | **⌘⇧D 与 ⌘⇧R** | ⌘⇧D：打开 Diff 视图（只读）；⌘⇧R：触发 Review（可提交/comment/approve）。Runtime 提供对应 API，UI 调用。 |
+
+---
+
+## 13. 远程通知通道（Remote Channels）
+
+### 13.1 目标
+
+通过现有 IM 平台实现：手机/异地查看 agent 进度、接收告警通知、遥控命令。不建独立 App 或网站。
+
+### 13.2 实现策略
+
+- **搭架子时机**：提前搭架子，在 Runtime 稳定前可先建 `src/remotes/` 骨架，订阅接口占位
+- **平台优先级**：Discord、KOOK、飞书均采用 Bot 方案；飞书发送已实现，接收命令待实现
+
+### 13.3 支持优先级
+
+| 优先级 | 平台 | 说明 |
+|--------|------|------|
+| 1 | Discord | Bot API 发消息 + Gateway 收命令 |
+| 2 | KOOK | 国内可直连，Bot API 发消息 + Gateway 收命令 |
+| 3 | 飞书 | Bot API 发消息（app_id + app_secret → tenant_access_token）；接收命令暂未实现 |
+
+### 13.4 架构
+
+```
+Event Bus (AgentStateChange, Notification)
+         │
+         ├─→ 桌面系统通知 (notify-rust)
+         ├─→ UI 通知面板
+         └─→ RemoteChannelPublisher
+                    │
+                    ├─→ Discord Adapter
+                    ├─→ KOOK Adapter
+                    └─→ 飞书 Adapter（发送已实现）
+```
+
+统一抽象：`RemoteChannel` trait，配置驱动；各 Adapter 将平台无关消息格式化为平台格式（文本/卡片/Embed）并发送。
+
+### 13.5 推送内容（第一阶段）
+
+- Agent 状态变化：`workspace / worktree: Running → WaitingInput`
+- 需确认的告警：`workspace / worktree: Error`
+- 消息必须包含 **workspace**、**worktree** 标识，避免多实例/多 workspace 混淆
+- 后续可选：简要进度汇总（防刷屏，可节流）
+
+### 13.6 接收命令（遥控）
+
+支持 Bot 接收命令，调用 Runtime API。Discord 斜杠命令、KOOK 消息解析等：
+
+- `status`：查询所有 agent 状态
+- `restart <worktree>`：重启指定 worktree
+- `send <worktree> <text>`：向指定 worktree 发送输入（需谨慎，可配置白名单）
+
+### 13.7 配置与敏感信息
+
+- **配置共享**：Remote 配置跨 pmux 实例共享，所有推送消息需明确 workspace、worktree
+- **敏感信息**：`bot_token` 等存于 `~/.config/pmux/secrets.json`，不纳入 config.json
+- **Discord、KOOK 仅 Bot**：不使用 Webhook，统一用 Bot API 发消息 + Gateway 收命令
+- **.gitignore**：`secrets.json` 加入忽略
+
+### 13.8 配置示例
+
+**config.json**（不含敏感信息）：
+
+```json
+{
+  "remote_channels": {
+    "discord": { "enabled": true, "channel_id": "123456789" },
+    "kook": { "enabled": true, "channel_id": "xxx" },
+    "feishu": { "enabled": true, "chat_id": "oc_xxx" }
+  }
+}
+```
+
+**~/.config/pmux/secrets.json**（git 忽略）：
+
+```json
+{
+  "remote_channels": {
+    "discord": {
+      "bot_token": "YOUR_BOT_TOKEN"
+    },
+    "kook": {
+      "bot_token": "xxx"
+    },
+    "feishu": {
+      "app_id": "cli_xxx",
+      "app_secret": "xxx"
+    }
+  }
+}
+```
+
+### 13.9 实现位置
+
+- 新增：`src/remotes/`（`channel.rs`、`publisher.rs`、`discord.rs`、`kook.rs`、`feishu.rs`）
+- 依赖：`reqwest` 发 HTTP
+- 订阅 Event Bus，与 Runtime 解耦；接收命令时调用 Runtime API
+
+---
+
+## 14. 语音输入/输出（Voice I/O）
+
+### 14.1 目标
+
+通过语音驱动 agent 实现代码：用户说话下达任务，系统朗读 agent 状态/告警。
+
+### 14.2 语音输入目标
+
+| 层级 | 说明 |
+|------|------|
+| **焦点 Pane** | 语音任务发送给当前获取焦点的 pane |
+| **多 Pane 时** | 若一个 worktree 有多个 pane，发送给**第一个** pane |
+| **无 Agent 时** | 若第一个 pane 未启动 agent，自动启动**默认 agent** |
+
+### 14.3 默认 Agent 配置层级
+
+默认 agent（如 `claude`、`opencode`）按**由全局到具体**顺序读取，后者覆盖前者（worktree 最优先）：
+
+| 优先级 | 作用域 | 配置路径示例 | 说明 |
+|--------|--------|--------------|------|
+| 1 | 全局 | `config.default_agent` | 基础默认 |
+| 2 | Workspace | `workspaces[].default_agent` | 覆盖全局 |
+| 3 | Worktree | `worktrees[].default_agent` | 覆盖 workspace |
+
+解析时：worktree → workspace → global，取第一个有值的。未配置时 fallback 到固定默认（如 `claude`）。
+
+### 14.4 语音输出
+
+- 订阅 Event Bus（`AgentStateChange`、`Notification`）
+- 关键事件触发 TTS：WaitingInput、Error、Exited 等
+- 支持中英双语
+
+### 14.5 语言支持
+
+STT（语音转文字）和 TTS（文字转语音）均支持**中文 + 英文**，可按用户配置或系统语言选择。
+
+### 14.6 配置示例
+
+```json
+{
+  "default_agent": "claude",
+  "workspaces": [
+    {
+      "path": "~/projects/repo-a",
+      "default_agent": "opencode"
+    }
+  ],
+  "worktrees": {
+    "feat-auth": {
+      "default_agent": "claude"
+    }
+  },
+  "voice": {
+    "enabled": true,
+    "stt_provider": "whisper",
+    "tts_provider": "system",
+    "language": "auto"
+  }
+}
+```
+
+### 14.7 实现位置
+
+- 新增：`src/voice/`（`stt.rs`、`tts.rs`、`input_handler.rs`）
+- 与现有 `Runtime.send_input`、Event Bus 对接
+- 需实现：`Runtime.spawn_default_agent(worktree)` 或等价 API
