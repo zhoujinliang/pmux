@@ -10,6 +10,43 @@ fn default_backend() -> String {
     "local".to_string()
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RemoteChannelsConfig {
+    #[serde(default)]
+    pub discord: DiscordChannelConfig,
+    #[serde(default)]
+    pub kook: KookChannelConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DiscordChannelConfig {
+    #[serde(default)]
+    pub enabled: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KookChannelConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub channel_id: Option<String>,
+}
+
+impl Default for DiscordChannelConfig {
+    fn default() -> Self {
+        Self { enabled: false }
+    }
+}
+
+impl Default for KookChannelConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            channel_id: None,
+        }
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -19,6 +56,7 @@ impl Default for Config {
             active_workspace_index: 0,
             per_repo_worktree_index: HashMap::new(),
             backend: default_backend(),
+            remote_channels: RemoteChannelsConfig::default(),
         }
     }
 }
@@ -55,6 +93,9 @@ pub struct Config {
     /// Runtime backend: "local" (PTY) or "tmux". Env PMUX_BACKEND overrides.
     #[serde(default = "default_backend")]
     pub backend: String,
+    /// Remote notification channels (Discord, KOOK)
+    #[serde(default)]
+    pub remote_channels: RemoteChannelsConfig,
 }
 
 impl Config {
@@ -358,6 +399,21 @@ mod tests {
         std::fs::write(&path, r#"{"backend": "tmux"}"#).unwrap();
         let config = Config::load_from_path(&path).unwrap();
         assert_eq!(config.backend, "tmux");
+    }
+
+    /// Test: remote_channels loads discord.enabled and kook.channel_id from JSON
+    #[test]
+    fn test_config_remote_channels() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("config.json");
+        std::fs::write(
+            &path,
+            r#"{"remote_channels":{"discord":{"enabled":true},"kook":{"enabled":true,"channel_id":"123"}}}"#,
+        )
+        .unwrap();
+        let config = Config::load_from_path(&path).unwrap();
+        assert!(config.remote_channels.discord.enabled);
+        assert_eq!(config.remote_channels.kook.channel_id.as_deref(), Some("123"));
     }
 
     /// Test: migrate_from_legacy populates workspace_paths from recent_workspace
