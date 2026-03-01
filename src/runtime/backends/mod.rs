@@ -5,6 +5,7 @@
 mod local_pty;
 #[cfg(unix)]
 mod tmux;
+pub mod tmux_control_mode;
 
 pub use local_pty::LocalPtyRuntime;
 #[cfg(unix)]
@@ -26,7 +27,7 @@ pub const DEFAULT_BACKEND: &str = "local";
 /// Resolve backend: PMUX_BACKEND env > config.backend > "local".
 /// Invalid values (non-local/tmux) fall back to DEFAULT_BACKEND.
 pub fn resolve_backend(config: Option<&Config>) -> String {
-    const VALID: [&str; 2] = ["local", "tmux"];
+    const VALID: [&str; 3] = ["local", "tmux", "tmux-cc"];
     let from_env = std::env::var(PMUX_BACKEND_ENV).ok();
     let from_config = config.map(|c| c.backend.as_str());
     let raw = from_env.as_deref().or(from_config).unwrap_or(DEFAULT_BACKEND);
@@ -131,6 +132,38 @@ pub fn create_runtime_from_env(
                 "tmux backend not supported on non-Unix platforms".into(),
             ))
         }
+        "tmux-cc" => {
+            #[cfg(unix)]
+            {
+                if !tmux_available() {
+                    let rt = create_runtime(worktree_path, cols, rows)?;
+                    return Ok(RuntimeCreationResult {
+                        runtime: rt,
+                        fallback_message: Some("tmux 不可用，已回退到 local".to_string()),
+                    });
+                }
+                let session_name = session_name_for_workspace(workspace_path);
+                let window_name = window_name_for_worktree(worktree_path, branch_name);
+                let runtime = Arc::new(
+                    tmux_control_mode::TmuxControlModeRuntime::new(
+                        &session_name,
+                        &window_name,
+                        Some(worktree_path),
+                    )
+                    .map_err(|e| RuntimeError::Backend(format!("tmux-cc: {}", e)))?,
+                );
+                return Ok(RuntimeCreationResult {
+                    runtime,
+                    fallback_message: None,
+                });
+            }
+            #[cfg(not(unix))]
+            {
+                return Err(RuntimeError::Backend(
+                    "tmux-cc not supported on this platform".into(),
+                ));
+            }
+        }
         "local" | _ => {
             let rt = create_runtime(worktree_path, cols, rows)?;
             Ok(RuntimeCreationResult {
@@ -195,6 +228,15 @@ pub fn recover_runtime(
             )?;
             Ok(Arc::new(runtime))
         }
+        "tmux-cc" => {
+            let runtime = tmux_control_mode::TmuxControlModeRuntime::new(
+                &state.backend_session_id,
+                &state.backend_window_id,
+                None,
+            )
+            .map_err(|e| RuntimeError::Backend(format!("tmux-cc recover: {}", e)))?;
+            Ok(Arc::new(runtime))
+        }
         _ => Err(RuntimeError::Backend(format!(
             "unknown backend: {}",
             backend
@@ -215,6 +257,9 @@ pub fn recover_runtime(
         )),
         "tmux" => Err(RuntimeError::Backend(
             "tmux backend not supported on non-Unix platforms".into(),
+        )),
+        "tmux-cc" => Err(RuntimeError::Backend(
+            "tmux-cc not supported on non-Unix platforms".into(),
         )),
         _ => Err(RuntimeError::Backend(format!(
             "unknown backend: {}",
@@ -279,6 +324,14 @@ mod tests {
         config.backend = "tmux".to_string();
         let backend = resolve_backend(Some(&config));
         assert_eq!(backend, "local");
+        std::env::remove_var("PMUX_BACKEND");
+    }
+
+    #[test]
+    fn test_resolve_backend_accepts_tmux_cc() {
+        std::env::set_var("PMUX_BACKEND", "tmux-cc");
+        let backend = resolve_backend(None);
+        assert_eq!(backend, "tmux-cc");
         std::env::remove_var("PMUX_BACKEND");
     }
 
