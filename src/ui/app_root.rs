@@ -9,7 +9,8 @@ use crate::git_utils::{is_git_repository, get_git_error_message, GitError};
 use crate::notification::NotificationType;
 use crate::notification_manager::NotificationManager;
 use crate::system_notifier;
-use crate::terminal::TerminalEngine;
+use crate::shell_integration::ShellPhaseInfo;
+use crate::terminal::{ContentExtractor, RuntimeReader, RuntimeWriter, tee_output};
 use crate::runtime::{AgentRuntime, EventBus, RuntimeEvent, StatusPublisher};
 use crate::runtime::backends::{create_runtime_from_env, recover_runtime, resolve_backend, window_name_for_worktree, window_target};
 use crate::runtime::{RuntimeState, WorktreeState};
@@ -22,11 +23,12 @@ use crate::new_branch_orchestrator::{NewBranchOrchestrator, CreationResult, Noti
 use crate::notification::Notification;
 use gpui::prelude::FluentBuilder;
 use gpui::*;
+use gpui_terminal::{ColorPalette, TerminalConfig};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 /// When true, AppRoot will set show_settings=true and clear this flag at start of render.
 /// Used by menu action (open_settings) to open Settings from main.rs without window access.
@@ -110,9 +112,11 @@ pub struct AppRoot {
     terminal_needs_focus: bool,
     /// Stable focus handle for terminal area (must persist across renders for key events)
     terminal_focus: Option<FocusHandle>,
-    /// ResizeController: debounced window bounds → (cols, rows) for engine/runtime resize.
-    /// Resize is driven here, NOT by TerminalElement/TerminalView request_layout/prepaint/paint.
+    /// ResizeController: debounced window bounds → (cols, rows) for runtime resize.
+    /// Resize is driven here; gpui-terminal uses with_resize_callback.
     resize_controller: ResizeController,
+    /// Last (cols, rows) we resized to. Used to initialize new engines at full size (avoids flash).
+    preferred_terminal_dims: Option<(u16, u16)>,
     /// When true, show the Settings modal overlay
     show_settings: bool,
     /// Draft config when Settings is open; None when closed. Updated on open and by toggles.
@@ -239,6 +243,7 @@ impl AppRoot {
             terminal_needs_focus: false,
             terminal_focus: None,
             resize_controller: ResizeController::new(),
+            preferred_terminal_dims: None,
             show_settings: false,
             settings_draft: None,
             settings_secrets_draft: None,
@@ -519,64 +524,78 @@ impl AppRoot {
         &mut self,
         runtime: Arc<dyn AgentRuntime>,
         pane_target: &str,
-        terminal_area_entity: Option<Entity<TerminalAreaEntity>>,
+        _terminal_area_entity: Option<Entity<TerminalAreaEntity>>,
         cx: &mut Context<Self>,
     ) {
-        let (cols, rows) = runtime.get_pane_dimensions(&pane_target.to_string());
+        let pane_target_str = pane_target.to_string();
+        let (cols, rows) = self
+            .preferred_terminal_dims
+            .unwrap_or_else(|| runtime.get_pane_dimensions(&pane_target_str));
 
-        let cache_size = Config::load().unwrap_or_default().terminal_row_cache_size();
+        if let Some((c, r)) = self.preferred_terminal_dims {
+            let _ = runtime.resize(&pane_target_str, c, r);
+        }
 
-        if let Some(rx) = runtime.subscribe_output(&pane_target.to_string()) {
-            let engine = Arc::new(TerminalEngine::new(cols as usize, rows as usize, rx));
-            let buffer = TerminalBuffer::new_term_with_cache_size(engine.clone(), cache_size);
+        if let Some(rx) = runtime.subscribe_output(&pane_target_str) {
+            let (rx1, rx2) = tee_output(rx);
+            let reader = RuntimeReader::new(rx1);
+            let writer = RuntimeWriter::new(runtime.clone(), pane_target_str.clone());
+
+            let config = TerminalConfig {
+                cols: cols as usize,
+                rows: rows as usize,
+                font_family: "Menlo".into(),
+                font_size: px(12.0),
+                scrollback: 10000,
+                line_height_multiplier: 1.0,
+                padding: Edges::all(px(0.0)),
+                colors: ColorPalette::default(),
+            };
+
+            let runtime_for_resize = runtime.clone();
+            let pane_for_resize = pane_target_str.clone();
+            let resize_callback = move |cols: usize, rows: usize| {
+                let _ = runtime_for_resize.resize(&pane_for_resize, cols as u16, rows as u16);
+            };
+
+            let gpui_terminal_entity = cx.new(|cx| {
+                gpui_terminal::TerminalView::new(writer, reader, config, cx)
+                    .with_resize_callback(resize_callback)
+            });
+
             if let Ok(mut buffers) = self.terminal_buffers.lock() {
                 buffers.clear();
-                buffers.insert(pane_target.to_string(), buffer);
+                buffers.insert(pane_target_str.clone(), TerminalBuffer::GpuiTerminal(gpui_terminal_entity));
             }
 
             let status_publisher = self.status_publisher.clone();
-            let pane_target_clone = pane_target.to_string();
-            let terminal_area_entity = terminal_area_entity;
+            let pane_target_clone = pane_target_str.clone();
+            let mut ext = ContentExtractor::new();
 
-            cx.spawn(async move |entity, cx| {
+            cx.spawn(async move |_entity, _cx| {
                 loop {
-                    blocking::unblock(|| std::thread::sleep(Duration::from_millis(16))).await;
-
-                    let content_changed = engine.advance_bytes();
-
+                    let chunk = match rx2.recv_async().await {
+                        Ok(c) => c,
+                        Err(_) => break,
+                    };
+                    ext.feed(&chunk);
+                    let shell_info = ShellPhaseInfo {
+                        phase: ext.shell_phase(),
+                        last_post_exec_exit_code: None,
+                    };
+                    let content_str = ext.take_content().0;
                     if let Some(ref pub_) = status_publisher {
-                        let shell_info = crate::shell_integration::ShellPhaseInfo {
-                            phase: engine.shell_phase(),
-                            last_post_exec_exit_code: engine.last_post_exec_exit_code(),
-                        };
-
-                        let content: Option<String> = entity.update(cx, |this, _cx| {
-                            if let Ok(buffers) = this.terminal_buffers.lock() {
-                                if let Some(buffer) = buffers.get(&pane_target_clone) {
-                                    return buffer.content_for_status_detection();
-                                }
-                            }
-                            None
-                        }).ok().flatten();
-
-                        if let Some(content_str) = content {
-                            let _ = pub_.check_status(
-                                &pane_target_clone,
-                                crate::status_detector::ProcessStatus::Running,
-                                Some(shell_info),
-                                &content_str,
-                            );
-                        }
+                        let _ = pub_.check_status(
+                            &pane_target_clone,
+                            crate::status_detector::ProcessStatus::Running,
+                            Some(shell_info),
+                            &content_str,
+                        );
                     }
-
-                    // Phase 4: notify terminal_area_entity if present, else AppRoot
-                    if content_changed {
-                        if let Some(ref e) = terminal_area_entity {
-                            let _ = e.update(cx, |_, cx| cx.notify());
-                        } else if entity.update(cx, |_, cx| cx.notify()).is_err() {
-                            break;
-                        }
-                    }
+                    // Don't notify terminal_area_entity on every chunk - causes rapid re-renders
+                    // that can make the terminal appear to disappear (Bug: Enter key). Terminal
+                    // display is driven by gpui_terminal's own reader (rx1); status updates
+                    // flow via StatusPublisher -> EventBus -> sidebar/status bar.
                 }
             })
             .detach();
@@ -584,7 +603,7 @@ impl AppRoot {
             if let Ok(mut buffers) = self.terminal_buffers.lock() {
                 buffers.clear();
                 buffers.insert(
-                    pane_target.to_string(),
+                    pane_target_str,
                     TerminalBuffer::Error("Streaming unavailable.".to_string()),
                 );
             }
@@ -598,65 +617,78 @@ impl AppRoot {
         &mut self,
         runtime: Arc<dyn AgentRuntime>,
         pane_target: &str,
-        terminal_area_entity: Option<Entity<TerminalAreaEntity>>,
+        _terminal_area_entity: Option<Entity<TerminalAreaEntity>>,
         cx: &mut Context<Self>,
     ) {
-        let (cols, rows) = runtime.get_pane_dimensions(&pane_target.to_string());
-        let cache_size = Config::load().unwrap_or_default().terminal_row_cache_size();
+        let pane_target_str = pane_target.to_string();
+        let (cols, rows) = runtime.get_pane_dimensions(&pane_target_str);
 
-        if let Some(rx) = runtime.subscribe_output(&pane_target.to_string()) {
-            let engine = Arc::new(TerminalEngine::new(cols as usize, rows as usize, rx));
-            let buffer = TerminalBuffer::new_term_with_cache_size(engine.clone(), cache_size);
+        if let Some(rx) = runtime.subscribe_output(&pane_target_str) {
+            let (rx1, rx2) = tee_output(rx);
+            let reader = RuntimeReader::new(rx1);
+            let writer = RuntimeWriter::new(runtime.clone(), pane_target_str.clone());
+
+            let config = TerminalConfig {
+                cols: cols as usize,
+                rows: rows as usize,
+                font_family: "Menlo".into(),
+                font_size: px(12.0),
+                scrollback: 10000,
+                line_height_multiplier: 1.0,
+                padding: Edges::all(px(0.0)),
+                colors: ColorPalette::default(),
+            };
+
+            let runtime_for_resize = runtime.clone();
+            let pane_for_resize = pane_target_str.clone();
+            let resize_callback = move |cols: usize, rows: usize| {
+                let _ = runtime_for_resize.resize(&pane_for_resize, cols as u16, rows as u16);
+            };
+
+            let gpui_terminal_entity = cx.new(|cx| {
+                gpui_terminal::TerminalView::new(writer, reader, config, cx)
+                    .with_resize_callback(resize_callback)
+            });
+
             if let Ok(mut buffers) = self.terminal_buffers.lock() {
-                buffers.insert(pane_target.to_string(), buffer);
+                buffers.insert(pane_target_str.clone(), TerminalBuffer::GpuiTerminal(gpui_terminal_entity));
             }
 
             let status_publisher = self.status_publisher.clone();
-            let pane_target_clone = pane_target.to_string();
-            let terminal_area_entity = terminal_area_entity;
-            cx.spawn(async move |entity, cx| {
+            let pane_target_clone = pane_target_str.clone();
+            let mut ext = ContentExtractor::new();
+
+            cx.spawn(async move |_entity, _cx| {
                 loop {
-                    blocking::unblock(|| std::thread::sleep(Duration::from_millis(16))).await;
-                    let content_changed = engine.advance_bytes();
+                    let chunk = match rx2.recv_async().await {
+                        Ok(c) => c,
+                        Err(_) => break,
+                    };
+                    ext.feed(&chunk);
+                    let shell_info = ShellPhaseInfo {
+                        phase: ext.shell_phase(),
+                        last_post_exec_exit_code: None,
+                    };
+                    let content_str = ext.take_content().0;
                     if let Some(ref pub_) = status_publisher {
-                        let shell_info = crate::shell_integration::ShellPhaseInfo {
-                            phase: engine.shell_phase(),
-                            last_post_exec_exit_code: engine.last_post_exec_exit_code(),
-                        };
-                        let content: Option<String> = entity
-                            .update(cx, |this, _cx| {
-                                if let Ok(buffers) = this.terminal_buffers.lock() {
-                                    if let Some(buffer) = buffers.get(&pane_target_clone) {
-                                        return buffer.content_for_status_detection();
-                                    }
-                                }
-                                None
-                            })
-                            .ok()
-                            .flatten();
-                        if let Some(content_str) = content {
-                            let _ = pub_.check_status(
-                                &pane_target_clone,
-                                crate::status_detector::ProcessStatus::Running,
-                                Some(shell_info),
-                                &content_str,
-                            );
-                        }
+                        let _ = pub_.check_status(
+                            &pane_target_clone,
+                            crate::status_detector::ProcessStatus::Running,
+                            Some(shell_info),
+                            &content_str,
+                        );
                     }
-                    if content_changed {
-                        if let Some(ref e) = terminal_area_entity {
-                            let _ = e.update(cx, |_, cx| cx.notify());
-                        } else if entity.update(cx, |_, cx| cx.notify()).is_err() {
-                            break;
-                        }
-                    }
+                    // Don't notify terminal_area_entity on every chunk - causes rapid re-renders
+                    // that can make the terminal appear to disappear (Bug: Enter key). Terminal
+                    // display is driven by gpui_terminal's own reader (rx1); status updates
+                    // flow via StatusPublisher -> EventBus -> sidebar/status bar.
                 }
             })
             .detach();
         } else {
             if let Ok(mut buffers) = self.terminal_buffers.lock() {
                 buffers.insert(
-                    pane_target.to_string(),
+                    pane_target_str,
                     TerminalBuffer::Error("Streaming unavailable.".to_string()),
                 );
             }
@@ -771,10 +803,31 @@ impl AppRoot {
                     }
                     this.active_pane_target = Some(target.clone());
                     if let Ok(mut guard) = this.active_pane_target_shared.lock() {
-                        *guard = target;
+                        *guard = target.clone();
+                    }
+                    this.terminal_needs_focus = false;
+                    if let Ok(buffers) = this.terminal_buffers.lock() {
+                        if let Some(TerminalBuffer::GpuiTerminal(entity)) = buffers.get(&target) {
+                            let entity = entity.clone();
+                            drop(buffers);
+                            entity.update(cx, |term, cx| {
+                                window.focus(term.focus_handle(), cx);
+                            });
+                        } else {
+                            drop(buffers);
+                            if let Some(ref focus) = terminal_focus {
+                                window.focus(focus, cx);
+                            }
+                        }
+                    } else if let Some(ref focus) = terminal_focus {
+                        window.focus(focus, cx);
+                    }
+                } else {
+                    this.terminal_needs_focus = true;
+                    if let Some(ref focus) = terminal_focus {
+                        window.focus(focus, cx);
                     }
                 }
-                this.terminal_needs_focus = true;
                 if let Ok(guard) = term_entity_holder_for_pane.lock() {
                     if let Some(ref e) = *guard {
                         let _ = cx.update_entity(e, |entity: &mut TerminalAreaEntity, cx| {
@@ -785,9 +838,6 @@ impl AppRoot {
                 }
                 cx.notify();
             });
-            if let Some(ref focus) = terminal_focus {
-                window.focus(focus, cx);
-            }
         }) as Arc<dyn Fn(usize, &mut Window, &mut App)>;
 
         let term_entity = cx.new(|_cx| {
@@ -837,13 +887,19 @@ impl AppRoot {
             .map(|t| t.path.clone())
             .unwrap_or_else(|| worktree_path.to_path_buf());
         let config = Config::load().ok();
-        let runtime = match create_runtime_from_env(&workspace_path, worktree_path, branch_name, 80, 24, config.as_ref()) {
-            Ok(rt) => rt,
+        let result = match create_runtime_from_env(&workspace_path, worktree_path, branch_name, 80, 24, config.as_ref()) {
+            Ok(r) => r,
             Err(e) => {
                 self.state.error_message = Some(format!("Runtime error: {}", e));
                 return;
             }
         };
+        if let Some(msg) = &result.fallback_message {
+            if let Ok(mut mgr) = self.notification_manager.lock() {
+                mgr.add("", crate::notification::NotificationType::Info, msg);
+            }
+        }
+        let runtime = result.runtime;
         let pane_target = runtime
             .primary_pane_id()
             .unwrap_or_else(|| format!("local:{}", worktree_path.display()));
@@ -928,37 +984,33 @@ impl AppRoot {
             // Restore active_worktree_index for this repo
             let restored_idx = self.per_repo_worktree_index.get(&repo_path).copied();
 
-            if let Some(awi) = restored_idx {
-                if awi < worktrees.len() {
-                    self.active_worktree_index = Some(awi);
-                    if let Some(wt) = worktrees.get(awi) {
-                        let path = wt.path.clone();
-                        let branch = wt.short_branch_name().to_string();
-                        self.switch_to_worktree(&path, &branch, cx);
-                        cx.notify();
-                        return;
-                    }
-                }
-            }
-
-            // No saved worktree or invalid index: use first worktree if any
-            self.active_worktree_index = None;
-            if !worktrees.is_empty() {
-                self.active_worktree_index = Some(0);
-                let wt = &worktrees[0];
-                let wt_path = wt.path.clone();
-                let branch = wt.short_branch_name().to_string();
-                self.switch_to_worktree(&wt_path, &branch, cx);
-                cx.notify();
+            let (wt_path, branch, worktree_idx) = if worktrees.is_empty() {
+                self.schedule_start_main_session(&repo_path, cx);
                 return;
-            }
-            self.start_local_session(&repo_path, "main", cx);
+            } else if let Some(awi) = restored_idx {
+                if awi < worktrees.len() {
+                    let wt = &worktrees[awi];
+                    self.active_worktree_index = Some(awi);
+                    (wt.path.clone(), wt.short_branch_name().to_string(), awi)
+                } else {
+                    let wt = &worktrees[0];
+                    self.active_worktree_index = Some(0);
+                    (wt.path.clone(), wt.short_branch_name().to_string(), 0)
+                }
+            } else {
+                let wt = &worktrees[0];
+                self.active_worktree_index = Some(0);
+                (wt.path.clone(), wt.short_branch_name().to_string(), 0)
+            };
+
+            self.schedule_switch_to_worktree_async(&repo_path, &wt_path, &branch, worktree_idx, cx);
         }
         cx.notify();
     }
 
     /// Start tmux session for the currently active workspace tab (no state save).
     /// Used when closing a tab to switch to the new active tab.
+    /// Uses async runtime creation to avoid UI lag.
     fn start_session_for_active_tab(&mut self, cx: &mut Context<Self>) {
         if let Some(tab) = self.workspace_manager.active_tab() {
             let repo_path = tab.path.clone();
@@ -966,27 +1018,26 @@ impl AppRoot {
             let worktrees = &self.cached_worktrees;
             let restored_idx = self.per_repo_worktree_index.get(&repo_path).copied();
 
-            if let Some(awi) = restored_idx {
-                if awi < worktrees.len() {
-                    self.active_worktree_index = Some(awi);
-                    if let Some(wt) = worktrees.get(awi) {
-                        let path = wt.path.clone();
-                        let branch = wt.short_branch_name().to_string();
-                        self.switch_to_worktree(&path, &branch, cx);
-                        cx.notify();
-                        return;
-                    }
-                }
-            }
-
-            self.active_worktree_index = None;
-            if !worktrees.is_empty() {
-                let wt = &worktrees[0];
-                let wt_path = wt.path.clone();
-                let branch = wt.short_branch_name().to_string();
-                self.switch_to_worktree(&wt_path, &branch, cx);
+            if worktrees.is_empty() {
+                self.active_worktree_index = None;
+                self.schedule_start_main_session(&repo_path, cx);
             } else {
-                self.start_local_session(&repo_path, "main", cx);
+                let (wt_path, branch, idx) = if let Some(awi) = restored_idx {
+                    if awi < worktrees.len() {
+                        let wt = &worktrees[awi];
+                        self.active_worktree_index = Some(awi);
+                        (wt.path.clone(), wt.short_branch_name().to_string(), awi)
+                    } else {
+                        let wt = &worktrees[0];
+                        self.active_worktree_index = Some(0);
+                        (wt.path.clone(), wt.short_branch_name().to_string(), 0)
+                    }
+                } else {
+                    let wt = &worktrees[0];
+                    self.active_worktree_index = Some(0);
+                    (wt.path.clone(), wt.short_branch_name().to_string(), 0)
+                };
+                self.schedule_switch_to_worktree_async(&repo_path, &wt_path, &branch, idx, cx);
             }
         }
         cx.notify();
@@ -997,8 +1048,9 @@ impl AppRoot {
     }
 
     fn effective_backend(&self) -> String {
-        std::env::var(crate::runtime::backends::PMUX_BACKEND_ENV)
-            .unwrap_or_else(|_| crate::runtime::backends::DEFAULT_BACKEND.to_string())
+        crate::runtime::backends::resolve_backend(
+            crate::config::Config::load().ok().as_ref(),
+        )
     }
 
     /// Try recover from runtime_state. For local PTY, always returns false (no session recovery).
@@ -1239,8 +1291,8 @@ impl AppRoot {
             .map(|t| t.path.clone())
             .unwrap_or_else(|| worktree_path.to_path_buf());
         let config = Config::load().ok();
-        let runtime = match create_runtime_from_env(&workspace_path, worktree_path, branch_name, 80, 24, config.as_ref()) {
-            Ok(rt) => rt,
+        let result = match create_runtime_from_env(&workspace_path, worktree_path, branch_name, 80, 24, config.as_ref()) {
+            Ok(r) => r,
             Err(e) => {
                 self.state.error_message = Some(format!(
                     "Runtime error for worktree {}: {}",
@@ -1250,6 +1302,12 @@ impl AppRoot {
                 return;
             }
         };
+        if let Some(msg) = &result.fallback_message {
+            if let Ok(mut mgr) = self.notification_manager.lock() {
+                mgr.add("", crate::notification::NotificationType::Info, msg);
+            }
+        }
+        let runtime = result.runtime;
         let pane_target = runtime
             .primary_pane_id()
             .unwrap_or_else(|| format!("local:{}", worktree_path.display()));
@@ -1301,13 +1359,116 @@ impl AppRoot {
             .await;
 
             match result {
-                Ok(runtime) => {
-                    let pane_target = runtime
+                Ok(creation) => {
+                    let pane_target = creation.runtime
                         .primary_pane_id()
                         .unwrap_or_else(|| format!("local:{}", path.display()));
+                    let fallback_msg = creation.fallback_message.clone();
                     let _ = entity.update(cx, |this: &mut AppRoot, cx| {
                         this.worktree_switch_loading = None;
-                        this.attach_runtime(runtime, pane_target, &path, &branch, cx, None);
+                        if let Some(ref msg) = fallback_msg {
+                            if let Ok(mut mgr) = this.notification_manager.lock() {
+                                mgr.add("", crate::notification::NotificationType::Info, msg);
+                            }
+                        }
+                        this.attach_runtime(creation.runtime, pane_target, &path, &branch, cx, None);
+                        cx.notify();
+                    });
+                }
+                Err(e) => {
+                    let _ = entity.update(cx, |this: &mut AppRoot, cx| {
+                        this.worktree_switch_loading = None;
+                        this.state.error_message = Some(format!("Runtime error: {}", e));
+                        cx.notify();
+                    });
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// Schedule async switch to worktree (avoids blocking main thread on create_runtime).
+    /// Shows loading state immediately; attach_runtime runs when creation completes.
+    fn schedule_switch_to_worktree_async(
+        &mut self,
+        workspace_path: &Path,
+        worktree_path: &Path,
+        branch_name: &str,
+        worktree_idx: usize,
+        cx: &mut Context<Self>,
+    ) {
+        self.worktree_switch_loading = Some(worktree_idx);
+        cx.notify();
+
+        let workspace_path = workspace_path.to_path_buf();
+        let worktree_path = worktree_path.to_path_buf();
+        let branch_name = branch_name.to_string();
+        let config = Config::load().ok();
+        cx.spawn(async move |entity, cx| {
+            let path_clone = worktree_path.clone();
+            let branch_clone = branch_name.clone();
+            let result = blocking::unblock(move || {
+                create_runtime_from_env(&workspace_path, &path_clone, &branch_clone, 80, 24, config.as_ref())
+            })
+            .await;
+
+            match result {
+                Ok(creation) => {
+                    let pane_target = creation.runtime
+                        .primary_pane_id()
+                        .unwrap_or_else(|| format!("local:{}", worktree_path.display()));
+                    let fallback_msg = creation.fallback_message.clone();
+                    let _ = entity.update(cx, |this: &mut AppRoot, cx| {
+                        this.worktree_switch_loading = None;
+                        if let Some(ref msg) = fallback_msg {
+                            if let Ok(mut mgr) = this.notification_manager.lock() {
+                                mgr.add("", crate::notification::NotificationType::Info, msg);
+                            }
+                        }
+                        this.attach_runtime(creation.runtime, pane_target, &worktree_path, &branch_name, cx, None);
+                        cx.notify();
+                    });
+                }
+                Err(e) => {
+                    let _ = entity.update(cx, |this: &mut AppRoot, cx| {
+                        this.worktree_switch_loading = None;
+                        this.state.error_message = Some(format!("Runtime error: {}", e));
+                        cx.notify();
+                    });
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// Schedule async start of main session (no worktrees, start_local_session).
+    fn schedule_start_main_session(&mut self, repo_path: &Path, cx: &mut Context<Self>) {
+        self.worktree_switch_loading = Some(0);
+        cx.notify();
+
+        let repo_path = repo_path.to_path_buf();
+        let repo_path_clone = repo_path.clone();
+        cx.spawn(async move |entity, cx| {
+            let result = blocking::unblock(move || {
+                let config = Config::load().ok();
+                create_runtime_from_env(&repo_path, &repo_path, "main", 80, 24, config.as_ref())
+            })
+            .await;
+
+            match result {
+                Ok(creation) => {
+                    let pane_target = creation.runtime
+                        .primary_pane_id()
+                        .unwrap_or_else(|| format!("local:{}", repo_path_clone.display()));
+                    let fallback_msg = creation.fallback_message.clone();
+                    let _ = entity.update(cx, |this: &mut AppRoot, cx| {
+                        this.worktree_switch_loading = None;
+                        if let Some(ref msg) = fallback_msg {
+                            if let Ok(mut mgr) = this.notification_manager.lock() {
+                                mgr.add("", crate::notification::NotificationType::Info, msg);
+                            }
+                        }
+                        this.attach_runtime(creation.runtime, pane_target, &repo_path_clone, "main", cx, None);
                         cx.notify();
                     });
                 }
@@ -1365,8 +1526,13 @@ impl AppRoot {
     /// Does NOT clear pane_statuses - preserves last known status for worktrees we're leaving
     /// (avoids flicker: main=Idle, switch to feature/test → main stays Idle, feature/test gets its status)
     fn stop_current_session(&mut self) {
+        self.preferred_terminal_dims = self.resize_controller.last_dims();
+        self.resize_controller.reset_for_new_session();
         self.status_publisher.take();
         self.terminal_area_entity.take();
+        if let Ok(mut buffers) = self.terminal_buffers.lock() {
+            buffers.clear();
+        }
 
         self.status_counts = StatusCounts::new();
         if let Ok(statuses) = self.pane_statuses.lock() {
@@ -1381,20 +1547,6 @@ impl AppRoot {
 
     /// Handle keyboard events
     fn handle_key_down(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
-        // #region agent log
-        crate::debug_log::dbg_log(
-            "app_root.rs:handle_key_down",
-            "key_down entry",
-            &serde_json::json!({
-                "key": event.keystroke.key,
-                "platform": event.keystroke.modifiers.platform,
-                "has_runtime": self.runtime.is_some(),
-                "has_target": self.active_pane_target.is_some(),
-                "target": self.active_pane_target.as_deref().unwrap_or("")
-            }),
-            "H1",
-        );
-        // #endregion
         // Check for Alt+Cmd+arrows (pane focus switch)
         if event.keystroke.modifiers.platform && event.keystroke.modifiers.alt {
             let pane_count = self.split_tree.pane_count();
@@ -1491,50 +1643,40 @@ impl AppRoot {
         match (&self.runtime, self.active_pane_target.as_ref()) {
             (Some(runtime), Some(target)) => {
                 let bytes_opt = key_to_xterm_escape(&key_name, modifiers);
-                // #region agent log
-                crate::debug_log::dbg_log(
-                    "app_root.rs:handle_key_down",
-                    "after key_to_xterm",
-                    &serde_json::json!({
-                        "key": key_name,
-                        "got_bytes": bytes_opt.is_some(),
-                        "bytes_len": bytes_opt.as_ref().map(|b| b.len())
-                    }),
-                    "H2",
-                );
-                // #endregion
                 if let Some(bytes) = bytes_opt {
+                    // When active pane uses GpuiTerminal, it receives keys and sends via RuntimeWriter.
+                    // Key events bubble to AppRoot - forwarding here would duplicate (e.g. "l" -> "ll").
+                    // Clicks now focus gpui_terminal, so it handles all input; don't forward.
+                    if let Ok(buffers) = self.terminal_buffers.lock() {
+                        if matches!(buffers.get(target), Some(TerminalBuffer::GpuiTerminal(_))) {
+                            return;
+                        }
+                    }
                     let send_result = runtime.send_input(target, &bytes);
-                    // #region agent log
-                    crate::debug_log::dbg_log(
-                        "app_root.rs:handle_key_down",
-                        "after send_input",
-                        &serde_json::json!({
-                            "send_ok": send_result.is_ok(),
-                            "backend": runtime.backend_type()
-                        }),
-                        "H4",
-                    );
-                    // #endregion
                     if let Err(e) = send_result {
                         eprintln!("pmux: send_input failed: {}", e);
                     }
                 }
             }
             _ => {
-                // #region agent log
-                crate::debug_log::dbg_log(
-                    "app_root.rs:handle_key_down",
-                    "no forward branch",
-                    &serde_json::json!({
-                        "key": key_name,
-                        "platform": modifiers.platform,
-                        "reason": if self.runtime.is_none() { "no_runtime" } else { "no_target" }
-                    }),
-                    "H2",
-                );
-                // #endregion
                 if !modifiers.platform {
+                    // #region agent log
+                    static DROP_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                    let c = DROP_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if c < 5 {
+                        crate::debug_log::dbg_session_log(
+                            "app_root.rs:handle_key_down",
+                            "key not forwarded",
+                            &serde_json::json!({
+                                "key": key_name,
+                                "runtime": self.runtime.is_some(),
+                                "target": self.active_pane_target.as_deref().unwrap_or("none"),
+                                "count": c + 1
+                            }),
+                            "H_keyboard",
+                        );
+                    }
+                    // #endregion
                     eprintln!(
                         "pmux: key '{}' not forwarded (runtime={} target={})",
                         key_name,
@@ -1672,7 +1814,7 @@ impl AppRoot {
         // Add buffer for overlay pane (streaming will populate)
         if let Ok(mut buffers) = self.terminal_buffers.lock() {
             buffers.entry(pane_target.clone()).or_insert_with(|| {
-                TerminalBuffer::new_empty_term(80, 24)
+                TerminalBuffer::Empty
             });
         }
 
@@ -1877,12 +2019,11 @@ impl AppRoot {
                     self.active_worktree_index = None;
                     self.stop_current_session();
                 } else {
+                    let wt = worktrees.first().unwrap();
+                    let wt_path = wt.path.clone();
+                    let branch = wt.short_branch_name().to_string();
                     self.active_worktree_index = Some(0);
-                    if let Some(wt) = worktrees.first() {
-                        let path = wt.path.clone();
-                        let branch = wt.short_branch_name().to_string();
-                        self.switch_to_worktree(&path, &branch, cx);
-                    }
+                    self.schedule_switch_to_worktree_async(&repo_path, &wt_path, &branch, 0, cx);
                 }
             }
             Err(e) => {
@@ -2382,16 +2523,12 @@ impl AppRoot {
                                 let app_root_entity_for_drag = app_root_entity.clone();
                                 let app_root_entity_for_drag_end = app_root_entity.clone();
                                 let app_root_entity_for_pane_click = app_root_entity.clone();
-                                let terminal_focus_for_click = terminal_focus.clone();
                                 let terminal_focus_for_pane = terminal_focus.clone();
                                 div()
                                     .flex_1()
                                     .min_h_0()
                                     .overflow_hidden()
                                     .cursor(gpui::CursorStyle::IBeam)
-                                    .on_mouse_down(gpui::MouseButton::Left, move |_event, window, cx| {
-                                        window.focus(&terminal_focus_for_click, cx);
-                                    })
                                     .child(
                                         if worktree_switch_loading.is_some() {
                                             div()
@@ -2442,13 +2579,29 @@ impl AppRoot {
                                                         }
                                                         this.active_pane_target = Some(target.clone());
                                                         if let Ok(mut guard) = this.active_pane_target_shared.lock() {
-                                                            *guard = target;
+                                                            *guard = target.clone();
                                                         }
+                                                        this.terminal_needs_focus = false;
+                                                        // Focus gpui_terminal so it receives keys (avoids duplication + broken Enter)
+                                                        if let Ok(buffers) = this.terminal_buffers.lock() {
+                                                            if let Some(TerminalBuffer::GpuiTerminal(entity)) = buffers.get(&target) {
+                                                                let entity = entity.clone();
+                                                                drop(buffers);
+                                                                entity.update(cx, |term, cx| {
+                                                                    window.focus(term.focus_handle(), cx);
+                                                                });
+                                                            } else {
+                                                                drop(buffers);
+                                                                window.focus(&terminal_focus_for_pane, cx);
+                                                            }
+                                                        } else {
+                                                            window.focus(&terminal_focus_for_pane, cx);
+                                                        }
+                                                    } else {
+                                                        this.terminal_needs_focus = true;
                                                     }
-                                                    this.terminal_needs_focus = true;
                                                     cx.notify();
                                                 });
-                                                window.focus(&terminal_focus_for_pane, cx);
                                             })
                                             .into_any_element()
                                         }
@@ -2493,7 +2646,7 @@ impl AppRoot {
                         .lock()
                         .ok()
                         .and_then(|g| g.get(pane_target).cloned())
-                        .unwrap_or_else(|| TerminalBuffer::new_empty_term(80, 24));
+                        .unwrap_or(TerminalBuffer::Empty);
                     let branch = branch.clone();
                     let window_name = window_name.clone();
                     let session = session.clone();
@@ -2523,66 +2676,76 @@ impl Render for AppRoot {
             self.settings_secrets_draft = Secrets::load().ok();
         }
 
-        // #region agent log — render timing for bottleneck validation
-        let _render_timing = {
-            let start = Instant::now();
-            struct Guard(std::time::Instant);
-            impl Drop for Guard {
-                fn drop(&mut self) {
-                    let ms = self.0.elapsed().as_millis() as u64;
-                    crate::debug_log::dbg_render_sample(ms);
-                }
-            }
-            Guard(start)
-        };
-        // #endregion
-        // Resize PTY and TermBridge via ResizeController (debounced, NOT in request_layout/prepaint/paint).
-        // TerminalElement/TerminalView do NOT trigger resize.
+        // Resize runtime panes via ResizeController (debounced). gpui-terminal uses with_resize_callback.
+        // Bug3 fix: Only schedule resize when buffer_count > 0. After stop_current_session, buffers
+        // are cleared and setup_local_terminal inserts new buffers async. If we schedule with empty
+        // buffers, on_next_frame resizes 0 engines. Skip until buffers exist.
         if self.has_workspaces() && !self.resize_controller.is_pending() {
-            let bounds = window.window_bounds().get_bounds();
-            let w = f32::from(bounds.size.width);
-            let h = f32::from(bounds.size.height);
-            let sidebar_w = if self.sidebar_visible { self.sidebar_width as f32 } else { 0. };
-            let (cols, rows) = ResizeController::compute_dims_from_bounds(
-                w, h, self.sidebar_visible, sidebar_w,
-            );
-            if let Some((cols, rows)) = self.resize_controller.maybe_resize(cols, rows) {
-                self.resize_controller.set_pending(true);
-                let pane_targets: Vec<String> =
-                    self.split_tree.flatten().into_iter().map(|(t, _)| t).collect();
-                let runtime = self.runtime.clone();
-                let terminal_buffers = self.terminal_buffers.clone();
-                let entity = cx.entity();
-                window.on_next_frame(move |_window, cx| {
-                    if let Some(ref rt) = runtime {
-                        for pane_target in &pane_targets {
-                            let _ = rt.resize(pane_target, cols, rows);
-                        }
-                    }
-                    if let Ok(mut buffers) = terminal_buffers.lock() {
-                        for buf in buffers.values_mut() {
-                            if let TerminalBuffer::Term(engine, _) = buf {
-                                engine.resize(cols as usize, rows as usize);
+            let buffer_count = self.terminal_buffers.lock().map(|b| b.len()).unwrap_or(0);
+            if buffer_count > 0 {
+                let bounds = window.window_bounds().get_bounds();
+                let w = f32::from(bounds.size.width);
+                let h = f32::from(bounds.size.height);
+                let sidebar_w = if self.sidebar_visible { self.sidebar_width as f32 } else { 0. };
+                let (cols, rows) = ResizeController::compute_dims_from_bounds(
+                    w, h, self.sidebar_visible, sidebar_w,
+                );
+                let resize_result = self.resize_controller.maybe_resize(cols, rows);
+                if let Some((cols, rows)) = resize_result {
+                    self.resize_controller.set_pending(true);
+                    let pane_targets: Vec<String> =
+                        self.split_tree.flatten().into_iter().map(|(t, _)| t).collect();
+                    let runtime = self.runtime.clone();
+                    let entity = cx.entity();
+                    let cols_log = cols;
+                    let rows_log = rows;
+                    window.on_next_frame(move |_window, cx| {
+                        if let Some(ref rt) = runtime {
+                            for pane_target in &pane_targets {
+                                let _ = rt.resize(pane_target, cols, rows);
                             }
                         }
-                    }
-                    let _ = entity.update(cx, |this, cx| {
-                        this.resize_controller.set_pending(false);
-                        cx.notify();
+                        // GpuiTerminal: resize handled via with_resize_callback in TerminalView
+                        let _ = entity.update(cx, |this, cx| {
+                            this.resize_controller.set_pending(false);
+                            this.preferred_terminal_dims = Some((cols_log, rows_log));
+                            cx.notify();
+                        });
                     });
-                });
+                }
             }
         }
 
         // Cursor: Zed style - always visible, no blink
         let terminal_focus = self.terminal_focus.get_or_insert_with(|| cx.focus_handle()).clone();
 
-        // Auto-focus terminal when workspace loads so keyboard input works without clicking
+        // Auto-focus terminal when workspace loads so keyboard input works without clicking.
+        // For GpuiTerminal, focus the terminal entity itself so it receives key events.
+        // Use double on_next_frame so terminal DOM is fully mounted after worktree switch.
         if self.has_workspaces() && self.terminal_needs_focus {
             self.terminal_needs_focus = false;
+            let target = self.active_pane_target.clone();
+            let buffers = self.terminal_buffers.clone();
             let terminal_focus_for_frame = terminal_focus.clone();
             window.on_next_frame(move |window, cx| {
-                window.focus(&terminal_focus_for_frame, cx);
+                let target = target.clone();
+                let buffers = buffers.clone();
+                let terminal_focus_for_inner = terminal_focus_for_frame.clone();
+                window.on_next_frame(move |window, cx| {
+                    // If active pane has GpuiTerminal, focus it so it receives keys
+                    let buf = target.as_ref().and_then(|t| {
+                        buffers.lock().ok().and_then(|g| g.get(t).cloned())
+                    });
+                    if let Some(TerminalBuffer::GpuiTerminal(entity)) = buf {
+                        let entity = entity.clone();
+                        entity.update(cx, |term, cx| {
+                            window.focus(term.focus_handle(), cx);
+                        });
+                        return;
+                    }
+                    // Fallback: focus app root (handle_key_down will forward to send_input)
+                    window.focus(&terminal_focus_for_inner, cx);
+                });
             });
         }
 

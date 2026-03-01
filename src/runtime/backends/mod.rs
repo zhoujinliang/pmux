@@ -141,15 +141,16 @@ pub fn create_runtime_from_env(
     }
 }
 
-/// Create a LocalPtyRuntime for the given worktree path.
+/// Create a LocalPtyAgent for the given worktree path.
 /// Returns an AgentRuntime that supports multiple panes.
 pub fn create_runtime(
     worktree_path: &Path,
     cols: u16,
     rows: u16,
 ) -> Result<Arc<dyn AgentRuntime>, RuntimeError> {
-    let rt = LocalPtyRuntime::new(worktree_path, cols, rows)?;
-    Ok(Arc::new(rt))
+    Ok(Arc::new(local_pty::LocalPtyAgent::new(
+        worktree_path, cols, rows,
+    )?))
 }
 
 /// Create a TmuxRuntime for the given session and window.
