@@ -19,12 +19,10 @@ flume = "0.11"
 gpui = { git = "https://github.com/zed-industries/zed" }
 gpui_platform = { git = "https://github.com/zed-industries/zed", features = ["font-kit"] }
 anyhow = "1.0"
-alacritty_terminal = "0.25.1"
 notify-rust = "4"
 portable-pty = "0.8"
 libc = "0.2"
 log = "0.4"
-lru = "0.12"
 unicode-width = "0.1"
 nix = { version = "0.27", default-features = false, features = ["fs"] }
 downcast-rs = "1.2"

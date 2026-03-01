@@ -555,6 +555,14 @@ impl AppRoot {
             let runtime_for_resize = runtime.clone();
             let pane_for_resize = pane_target_str.clone();
             let resize_callback = move |cols: usize, rows: usize| {
+                // #region agent log
+                crate::debug_log::dbg_session_log(
+                    "app_root.rs:resize_callback(local)",
+                    "PTY resize fired",
+                    &serde_json::json!({"cols": cols, "rows": rows, "pane": &pane_for_resize}),
+                    "H8",
+                );
+                // #endregion
                 let _ = runtime_for_resize.resize(&pane_for_resize, cols as u16, rows as u16);
             };
 
@@ -1546,7 +1554,7 @@ impl AppRoot {
     }
 
     /// Handle keyboard events
-    fn handle_key_down(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
+    fn handle_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         // Check for Alt+Cmd+arrows (pane focus switch)
         if event.keystroke.modifiers.platform && event.keystroke.modifiers.alt {
             let pane_count = self.split_tree.pane_count();
@@ -1644,12 +1652,16 @@ impl AppRoot {
             (Some(runtime), Some(target)) => {
                 let bytes_opt = key_to_xterm_escape(&key_name, modifiers);
                 if let Some(bytes) = bytes_opt {
-                    // When active pane uses GpuiTerminal, it receives keys and sends via RuntimeWriter.
-                    // Key events bubble to AppRoot - forwarding here would duplicate (e.g. "l" -> "ll").
-                    // Clicks now focus gpui_terminal, so it handles all input; don't forward.
+                    // When GpuiTerminal is focused, it handles keys via RuntimeWriter and they
+                    // bubble up here — skip to avoid duplication. When AppRoot has focus (e.g.
+                    // auto-focus didn't reach gpui_terminal, or user clicked outside), forward
+                    // the keys so input still works.
                     if let Ok(buffers) = self.terminal_buffers.lock() {
-                        if matches!(buffers.get(target), Some(TerminalBuffer::GpuiTerminal(_))) {
-                            return;
+                        if let Some(TerminalBuffer::GpuiTerminal(entity)) = buffers.get(target) {
+                            let focused = entity.read(cx).focus_handle().is_focused(window);
+                            if focused {
+                                return; // gpui_terminal already handled this key
+                            }
                         }
                     }
                     let send_result = runtime.send_input(target, &bytes);
@@ -2542,7 +2554,7 @@ impl AppRoot {
                                                 .child("Connecting to worktree...")
                                                 .into_any_element()
                                         } else if let Some(ref term_entity) = self.terminal_area_entity {
-                                            div().child(term_entity.clone()).into_any_element()
+                                            div().size_full().child(term_entity.clone()).into_any_element()
                                         } else {
                                             SplitPaneContainer::new(
                                                 split_tree,
@@ -2723,6 +2735,14 @@ impl Render for AppRoot {
         // For GpuiTerminal, focus the terminal entity itself so it receives key events.
         // Use double on_next_frame so terminal DOM is fully mounted after worktree switch.
         if self.has_workspaces() && self.terminal_needs_focus {
+            // #region agent log
+            crate::debug_log::dbg_session_log(
+                "app_root.rs:render",
+                "terminal_needs_focus triggered in render",
+                &serde_json::json!({"target": self.active_pane_target.as_deref().unwrap_or("none")}),
+                "H2",
+            );
+            // #endregion
             self.terminal_needs_focus = false;
             let target = self.active_pane_target.clone();
             let buffers = self.terminal_buffers.clone();

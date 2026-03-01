@@ -7,7 +7,6 @@ use std::collections::HashMap;
 use std::io::Write;
 use std::path::Path;
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
@@ -93,12 +92,16 @@ impl TmuxRuntime {
     /// Create a new TmuxRuntime for the given session and window.
     /// Creates the tmux session and window if they don't exist.
     /// Spawns a writer thread that drains input to pane PTYs via direct write (no send-keys).
-    pub fn new(session_name: impl Into<String>, window_name: impl Into<String>) -> Self {
+    pub fn new(
+        session_name: impl Into<String>,
+        window_name: impl Into<String>,
+        start_dir: Option<&Path>,
+    ) -> Self {
         let session_name = session_name.into();
         let window_name = window_name.into();
 
         // Create tmux session and window if they don't exist
-        Self::ensure_session_and_window(&session_name, &window_name);
+        Self::ensure_session_and_window(&session_name, &window_name, start_dir);
 
         let (input_tx, input_rx) = flume::unbounded::<(PaneId, Vec<u8>)>();
         let pty_cache: Arc<Mutex<HashMap<PaneId, std::fs::File>>> = Arc::new(Mutex::new(HashMap::new()));
@@ -124,19 +127,16 @@ impl TmuxRuntime {
     }
 
     /// Ensure tmux session and window exist, creating them if necessary.
-    fn ensure_session_and_window(session_name: &str, window_name: &str) {
-        // First, try to create the session (detached, with the named window)
-        // This will fail if the session already exists, which is fine
-        let _ = Command::new("tmux")
-            .args([
-                "new-session",
-                "-d",
-                "-s",
-                session_name,
-                "-n",
-                window_name,
-            ])
-            .output();
+    fn ensure_session_and_window(
+        session_name: &str,
+        window_name: &str,
+        start_dir: Option<&Path>,
+    ) {
+        let mut args = vec!["new-session", "-d", "-s", session_name, "-n", window_name];
+        if let Some(dir) = start_dir.and_then(|p| p.to_str()) {
+            args.extend(["-c", dir]);
+        }
+        let _ = Command::new("tmux").args(&args).output();
 
         // Check if the window exists in the session
         let window_target = format!("{}:{}", session_name, window_name);
@@ -146,15 +146,11 @@ impl TmuxRuntime {
 
         // If window doesn't exist, create it
         if check.is_err() || !check.map(|o| o.status.success()).unwrap_or(false) {
-            let _ = Command::new("tmux")
-                .args([
-                    "new-window",
-                    "-t",
-                    session_name,
-                    "-n",
-                    window_name,
-                ])
-                .output();
+            let mut args = vec!["new-window", "-t", session_name, "-n", window_name];
+            if let Some(dir) = start_dir.and_then(|p| p.to_str()) {
+                args.extend(["-c", dir]);
+            }
+            let _ = Command::new("tmux").args(&args).output();
         }
     }
 
@@ -164,7 +160,7 @@ impl TmuxRuntime {
         session_id: &str,
         window_id: &str,
     ) -> Result<Self, crate::runtime::agent_runtime::RuntimeError> {
-        let rt = Self::new(session_id, window_id);
+        let rt = Self::new(session_id, window_id, None);
         // Verify session and window exist
         let target = rt.window_target();
         let output = std::process::Command::new("tmux")
@@ -269,7 +265,12 @@ impl AgentRuntime for TmuxRuntime {
     }
 
     fn send_input(&self, pane_id: &PaneId, bytes: &[u8]) -> Result<(), RuntimeError> {
-        // Route through input channel → writer thread → direct PTY write (no process spawn)
+        // Use tmux send-keys for Enter so pipe-pane captures command output (Bug2)
+        let is_enter = bytes == [b'\r'] || bytes == [b'\n'] || bytes == [b'\r', b'\n'];
+        if is_enter {
+            let target = self.pane_target(pane_id);
+            return self.tmux_cmd(&["send-keys", "-t", &target, "Enter"]);
+        }
         self.input_tx
             .send((pane_id.clone(), bytes.to_vec()))
             .map_err(|e| RuntimeError::Backend(e.to_string()))
@@ -302,50 +303,160 @@ impl AgentRuntime for TmuxRuntime {
         #[cfg(unix)]
         {
             let (tx, rx) = flume::unbounded();
+            // Bootstrap: pipe-pane 只流式新输出；注入当前 pane 内容（prompt 等）。
+            // 若 capture 只含空白行，则不注入，否则会把 prompt 推到屏幕中间。
+            if let Some(initial) = self.capture_initial_content(pane_id) {
+                let has_real_content = initial
+                    .iter()
+                    .any(|&b| b != b'\n' && b != b'\r' && b != b' ' && b != b'\t');
+                // Skip if leading blank lines (content would push prompt to middle of viewport)
+                let leading_newlines = initial
+                    .iter()
+                    .take_while(|&&b| b == b'\n' || b == b'\r' || b == b' ' || b == b'\t')
+                    .filter(|&&b| b == b'\n')
+                    .count();
+                // Skip long capture (changelog, dialogs) - only inject short prompt-like content
+                let too_long = initial.len() > 400;
+                let skip = !has_real_content || leading_newlines >= 3 || too_long;
+                // #region agent log
+                crate::debug_log::dbg_session_log(
+                    "tmux.rs:subscribe_output",
+                    "capture inject/skip (cursor-middle debug)",
+                    &serde_json::json!({
+                        "skip": skip,
+                        "has_real_content": has_real_content,
+                        "leading_newlines": leading_newlines,
+                        "too_long": too_long,
+                        "len": initial.len(),
+                        "preview": String::from_utf8_lossy(&initial[..initial.len().min(120)]).replace('\n', "\\n").replace('\r', "\\r")
+                    }),
+                    "H_cursor_mid",
+                );
+                // #endregion
+                if !skip {
+                    // Trim trailing newlines: second connect often has "prompt\n\n\n..."; without trim,
+                    // cursor ends up in middle. Do NOT add trailing \n - that would put cursor on next line.
+                    let trimmed: Vec<u8> = {
+                        let end = initial
+                            .iter()
+                            .rposition(|&b| b != b'\n' && b != b'\r')
+                            .map(|i| i + 1)
+                            .unwrap_or(0);
+                        initial[..end].to_vec()
+                    };
+                    // Cascade fix: capture-pane uses \n only, no \r. Normalize to \r\n.
+                    let normalized: Vec<u8> = trimmed
+                        .iter()
+                        .flat_map(|&b| if b == b'\n' { vec![b'\r', b'\n'] } else { vec![b] })
+                        .collect();
+                    // #region agent log
+                    crate::debug_log::dbg_session_log(
+                        "tmux.rs:subscribe_output",
+                        "inject (trimmed, no trailing nl)",
+                        &serde_json::json!({
+                            "trimmed_len": trimmed.len(),
+                            "normalized_len": normalized.len(),
+                            "ends_with_nl": trimmed.last() == Some(&b'\n')
+                        }),
+                        "H_cursor_mid",
+                    );
+                    // #endregion
+                    let _ = tx.send(normalized);
+                }
+            }
             let fifo_path = std::env::temp_dir().join(format!("pmux-pipe-{}", uuid::Uuid::new_v4()));
             if nix::unistd::mkfifo(&fifo_path, nix::sys::stat::Mode::S_IRWXU).is_err() {
                 return None;
             }
             let fifo_path = fifo_path.to_path_buf();
-            let stop = std::sync::Arc::new(AtomicBool::new(false));
 
-            // Reader thread: open fifo (blocks until writer opens), read and send to channel
+            // Reader thread: open fifo (blocks until writer opens), read and send to channel.
+            // Runs until tmux closes the pipe (EOF) — do NOT stop it early or terminal stays blank.
             let fifo_read = fifo_path.clone();
             let tx_clone = tx.clone();
-            let stop_clone = stop.clone();
+            let target_log = format!("{}:{}.{}", self.session_name, self.window_name, pane_id);
             thread::spawn(move || {
                 let file = match std::fs::File::open(&fifo_read) {
                     Ok(f) => f,
-                    Err(_) => return,
+                    Err(e) => {
+                        crate::debug_log::dbg_session_log(
+                            "tmux.rs:pipe_reader",
+                            "fifo open failed",
+                            &serde_json::json!({"err": e.to_string(), "target": target_log}),
+                            "H_ls_no_output",
+                        );
+                        return;
+                    }
                 };
                 let mut reader = std::io::BufReader::new(file);
                 let mut buf = [0u8; 4096];
-                while !stop_clone.load(Ordering::SeqCst) {
+                let mut chunk_count: u64 = 0;
+                let mut total_bytes: u64 = 0;
+                loop {
                     match std::io::Read::read(&mut reader, &mut buf) {
-                        Ok(0) => break,
+                        Ok(0) => break, // EOF when tmux closes pipe
                         Ok(n) => {
+                            total_bytes += n as u64;
+                            chunk_count += 1;
                             if tx_clone.send(buf[..n].to_vec()).is_err() {
                                 break;
                             }
+                            // #region agent log
+                            if chunk_count <= 2 || (chunk_count % 50 == 0) || buf[..n].contains(&b'\n') {
+                                crate::debug_log::dbg_session_log(
+                                    "tmux.rs:pipe_reader",
+                                    "bytes received",
+                                    &serde_json::json!({
+                                        "chunk": chunk_count,
+                                        "len": n,
+                                        "total": total_bytes,
+                                        "has_newline": buf[..n].contains(&b'\n'),
+                                    }),
+                                    "H_ls_no_output",
+                                );
+                            }
+                            // #endregion
                         }
-                        Err(_) => break,
+                        Err(e) => {
+                            crate::debug_log::dbg_session_log(
+                                "tmux.rs:pipe_reader",
+                                "read error",
+                                &serde_json::json!({"err": e.to_string(), "total": total_bytes}),
+                                "H_ls_no_output",
+                            );
+                            break;
+                        }
                     }
                 }
+                crate::debug_log::dbg_session_log(
+                    "tmux.rs:pipe_reader",
+                    "EOF",
+                    &serde_json::json!({"chunks": chunk_count, "total_bytes": total_bytes}),
+                    "H_ls_no_output",
+                );
                 let _ = std::fs::remove_file(&fifo_read);
             });
 
-            // Spawn pipe-pane: tmux pipe-pane -o -t {target} 'cat >> {fifo}'
+            // Spawn pipe-pane: tmux pipe-pane -o -t {target} 'dd of={fifo} bs=1 conv=fsync'
+            // Reader must keep running — do NOT signal it to stop.
             let fifo_str = fifo_path.to_string_lossy().to_string();
             let session = self.session_name.clone();
             let window = self.window_name.clone();
             let pane_id = pane_id.to_string();
+            let pipe_target = format!("{}:{}.{}", session, window, pane_id);
+            crate::debug_log::dbg_session_log(
+                "tmux.rs:subscribe_output",
+                "pipe-pane spawn",
+                &serde_json::json!({"target": pipe_target}),
+                "H_ls_no_output",
+            );
             thread::spawn(move || {
-                let target = format!("{}:{}.{}", session, window, pane_id);
-                let cmd = format!("cat >> {}", fifo_str);
+                let target = pipe_target;
+                // Use dd bs=1 for unbuffered write; cat buffers 4KB+ and hides ls output (Bug2)
+                let cmd = format!("dd of={} bs=1 conv=fsync 2>/dev/null", fifo_str);
                 let _ = Command::new("tmux")
                     .args(["pipe-pane", "-o", "-t", &target, &cmd])
                     .status();
-                stop.store(true, Ordering::SeqCst);
             });
 
             Some(rx)
@@ -461,7 +572,7 @@ fn escape_for_tmux_send_keys(s: &str) -> String {
 /// Returns None for unknown keys (caller falls back to literal).
 fn tmux_key_to_bytes(key: &str) -> Option<Vec<u8>> {
     Some(match key {
-        "Enter" | "Return" => vec![b'\r'],
+        "Enter" | "Return" => vec![b'\r', b'\n'],
         "Tab" => vec![b'\t'],
         "Space" => vec![b' '],
         "BackSpace" | "BS" => vec![0x7f],
@@ -503,14 +614,14 @@ mod tests {
 
     #[test]
     fn test_tmux_runtime_new() {
-        let rt = TmuxRuntime::new("pmux-test", "main");
+        let rt = TmuxRuntime::new("pmux-test", "main", None);
         assert_eq!(rt.pane_target(&"%0".to_string()), "pmux-test:main.%0");
         assert_eq!(rt.window_target(), "pmux-test:main");
     }
 
     #[test]
     fn test_tmux_runtime_pane_target() {
-        let rt = TmuxRuntime::new("mysession", "mywindow");
+        let rt = TmuxRuntime::new("mysession", "mywindow", None);
         assert_eq!(rt.pane_target(&"%1".to_string()), "mysession:mywindow.%1");
     }
 
@@ -523,7 +634,7 @@ mod tests {
 
     #[test]
     fn test_tmux_key_to_bytes() {
-        assert_eq!(tmux_key_to_bytes("Enter"), Some(vec![b'\r']));
+        assert_eq!(tmux_key_to_bytes("Enter"), Some(vec![b'\r', b'\n']));
         assert_eq!(tmux_key_to_bytes("Tab"), Some(vec![b'\t']));
         assert_eq!(tmux_key_to_bytes("Up"), Some(vec![0x1b, b'[', b'A']));
         assert_eq!(tmux_key_to_bytes("Down"), Some(vec![0x1b, b'[', b'B']));
@@ -535,7 +646,7 @@ mod tests {
     fn test_send_input_no_process_spawn() {
         use std::time::Instant;
         // send_input queues to channel - no process spawn per keystroke
-        let rt = TmuxRuntime::new("pmux-test", "main");
+        let rt = TmuxRuntime::new("pmux-test", "main", None);
         let pane_id = "%0".to_string();
 
         let start = Instant::now();
@@ -556,7 +667,7 @@ mod tests {
         if !tmux_available() {
             return;
         }
-        let rt = TmuxRuntime::new("nonexistent-session-xyz", "nonexistent-window");
+        let rt = TmuxRuntime::new("nonexistent-session-xyz", "nonexistent-window", None);
         let panes = rt.list_panes(&String::new());
         assert!(panes.is_empty());
     }
@@ -564,7 +675,7 @@ mod tests {
     #[test]
     fn test_tmux_runtime_send_key_no_process_spawn() {
         // send_key queues to input channel (no tmux process spawn); returns Ok immediately
-        let rt = TmuxRuntime::new("nonexistent-session-xyz", "nonexistent-window");
+        let rt = TmuxRuntime::new("nonexistent-session-xyz", "nonexistent-window", None);
         let result = rt.send_key(&"%0".to_string(), "Enter", false);
         assert!(result.is_ok(), "send_key should succeed (queue to channel, no blocking)");
     }
@@ -574,14 +685,14 @@ mod tests {
         if !tmux_available() {
             return;
         }
-        let rt = TmuxRuntime::new("pmux-test", "main");
+        let rt = TmuxRuntime::new("pmux-test", "main", None);
         let err = rt.kill_window("nonexistent:window");
         assert!(err.is_err());
     }
 
     #[test]
     fn test_tmux_runtime_get_pane_dimensions_invalid() {
-        let rt = TmuxRuntime::new("nonexistent-session", "nonexistent-window");
+        let rt = TmuxRuntime::new("nonexistent-session", "nonexistent-window", None);
         let (c, r) = rt.get_pane_dimensions(&"%0".to_string());
         assert_eq!(c, 80);
         assert_eq!(r, 24);
@@ -589,7 +700,7 @@ mod tests {
 
     #[test]
     fn test_tmux_runtime_open_diff_no_git() {
-        let rt = TmuxRuntime::new("pmux-test", "main");
+        let rt = TmuxRuntime::new("pmux-test", "main", None);
         let err = rt.open_diff(PathBuf::from("/nonexistent/path").as_path(), None);
         assert!(err.is_err());
     }

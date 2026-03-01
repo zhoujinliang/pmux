@@ -387,10 +387,7 @@ impl Default for DebouncedStatusTracker {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::shell_integration::{
-        MarkerKind, ParsedMarker, ShellMarker, ShellPhase, ShellPhaseInfo,
-    };
-    use crate::terminal::TerminalEngine;
+    use crate::shell_integration::{ShellPhase, ShellPhaseInfo};
 
     // --- Process status priority tests ---
 
@@ -550,65 +547,40 @@ mod tests {
         assert_eq!(status, AgentStatus::Running);
     }
 
+    /// StatusDetector with ShellPhaseInfo (from ContentExtractor) - no TerminalEngine.
     #[test]
-    fn test_integration_with_terminal_engine() {
-        let (tx, rx) = flume::unbounded();
-        let engine = TerminalEngine::new(80, 24, rx);
-        drop(tx);
-
+    fn test_integration_with_shell_phase_info() {
         let detector = StatusDetector::new();
 
-        // Initial state: Unknown
+        // Unknown phase -> Idle
         let info = ShellPhaseInfo {
-            phase: engine.shell_phase(),
-            last_post_exec_exit_code: engine.last_post_exec_exit_code(),
+            phase: ShellPhase::Unknown,
+            last_post_exec_exit_code: None,
         };
-        assert_eq!(info.phase, ShellPhase::Unknown);
-        let status = detector.detect(ProcessStatus::Running, Some(info), "hello");
-        assert_eq!(status, AgentStatus::Idle);
+        assert_eq!(
+            detector.detect(ProcessStatus::Running, Some(info), "hello"),
+            AgentStatus::Idle
+        );
 
-        // After PreExec: Running
-        {
-            let mut state = engine.shell_state();
-            let marker = ShellMarker::from_parsed(
-                ParsedMarker {
-                    kind: MarkerKind::PreExec,
-                    exit_code: None,
-                },
-                0,
-                0,
-            );
-            state.add_marker(marker);
-        }
+        // Running phase -> Running
         let info = ShellPhaseInfo {
-            phase: engine.shell_phase(),
-            last_post_exec_exit_code: engine.last_post_exec_exit_code(),
+            phase: ShellPhase::Running,
+            last_post_exec_exit_code: None,
         };
-        assert_eq!(info.phase, ShellPhase::Running);
-        let status = detector.detect(ProcessStatus::Running, Some(info), "any content");
-        assert_eq!(status, AgentStatus::Running);
+        assert_eq!(
+            detector.detect(ProcessStatus::Running, Some(info), "any content"),
+            AgentStatus::Running
+        );
 
-        // After PostExec with error: Error
-        {
-            let mut state = engine.shell_state();
-            let marker = ShellMarker::from_parsed(
-                ParsedMarker {
-                    kind: MarkerKind::PostExec,
-                    exit_code: Some(1),
-                },
-                1,
-                0,
-            );
-            state.add_marker(marker);
-        }
+        // Output + exit 1 -> Error
         let info = ShellPhaseInfo {
-            phase: engine.shell_phase(),
-            last_post_exec_exit_code: engine.last_post_exec_exit_code(),
+            phase: ShellPhase::Output,
+            last_post_exec_exit_code: Some(1),
         };
-        assert_eq!(info.phase, ShellPhase::Output);
-        assert_eq!(info.last_post_exec_exit_code, Some(1));
-        let status = detector.detect(ProcessStatus::Running, Some(info), "output");
-        assert_eq!(status, AgentStatus::Error);
+        assert_eq!(
+            detector.detect(ProcessStatus::Running, Some(info), "output"),
+            AgentStatus::Error
+        );
     }
 
     #[test]

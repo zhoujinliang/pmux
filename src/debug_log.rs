@@ -7,6 +7,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 const LOG_PATH: &str = "/Users/matt.chow/workspace/pmux/.cursor/debug-87bd77.log";
 
+/// Session debug log for current debug run
+const SESSION_LOG_PATH: &str = "/Users/matt.chow/workspace/pmux/.cursor/debug-df34ba.log";
+
 static RENDER_COUNT: AtomicU64 = AtomicU64::new(0);
 static RENDER_MAX_DURATION_MS: AtomicU64 = AtomicU64::new(0);
 static RENDER_LAST_SAMPLE_MS: AtomicU64 = AtomicU64::new(0);
@@ -45,6 +48,27 @@ pub fn dbg_render_sample(duration_ms: u64) {
             }),
             "H_render_bottleneck",
         );
+    }
+}
+
+/// Append NDJSON line to session debug log (for bug debugging runs).
+pub fn dbg_session_log(location: &str, message: &str, data: &serde_json::Value, hypothesis_id: &str) {
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let entry = serde_json::json!({
+        "sessionId": "df34ba",
+        "location": location,
+        "message": message,
+        "data": data,
+        "hypothesisId": hypothesis_id,
+        "timestamp": ts
+    });
+    if let Ok(s) = serde_json::to_string(&entry) {
+        if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(SESSION_LOG_PATH) {
+            let _ = writeln!(f, "{}", s);
+        }
     }
 }
 

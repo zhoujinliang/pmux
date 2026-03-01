@@ -65,7 +65,7 @@ use crate::colors::ColorPalette;
 use crate::event::GpuiEventProxy;
 use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::index::{Column, Line, Point as AlacPoint};
-use alacritty_terminal::term::Term;
+use alacritty_terminal::term::{Term, TermMode};
 use alacritty_terminal::term::cell::{Cell, Flags};
 use alacritty_terminal::term::color::Colors;
 use alacritty_terminal::vte::ansi::Color;
@@ -458,10 +458,11 @@ impl TerminalRenderer {
         window: &mut Window,
         _cx: &mut App,
     ) {
-        // Get terminal dimensions
+        // Get terminal dimensions and scroll state
         let grid = term.grid();
         let num_lines = grid.screen_lines();
         let num_cols = grid.columns();
+        let display_offset = grid.display_offset() as i32;
         let colors = term.colors();
 
         // Calculate default background color
@@ -486,9 +487,9 @@ impl TerminalRenderer {
             y: bounds.origin.y + padding.top,
         };
 
-        // Iterate over visible lines
+        // Iterate over visible lines (adjusted by display_offset for scrollback)
         for line_idx in 0..num_lines {
-            let line = Line(line_idx as i32);
+            let line = Line(line_idx as i32 - display_offset);
 
             // Collect cells for this line
             let cells: Vec<(usize, Cell)> = (0..num_cols)
@@ -714,35 +715,41 @@ impl TerminalRenderer {
             }
         }
 
-        // Paint cursor
-        let cursor_point = grid.cursor.point;
-        let cursor_x = origin.x + self.cell_width * (cursor_point.column.0 as f32);
-        let cursor_y = origin.y + self.cell_height * (cursor_point.line.0 as f32);
+        // Paint cursor (only when SHOW_CURSOR mode is active and cursor is in visible area)
+        if term.mode().contains(TermMode::SHOW_CURSOR) {
+            let cursor_point = grid.cursor.point;
+            let visual_line = cursor_point.line.0 + display_offset;
 
-        let cursor_color = self.palette.resolve(
-            Color::Named(alacritty_terminal::vte::ansi::NamedColor::Cursor),
-            colors,
-        );
+            if visual_line >= 0 && (visual_line as usize) < num_lines {
+                let cursor_x = origin.x + self.cell_width * (cursor_point.column.0 as f32);
+                let cursor_y = origin.y + self.cell_height * (visual_line as f32);
 
-        let cursor_bounds = Bounds {
-            origin: Point {
-                x: cursor_x,
-                y: cursor_y,
-            },
-            size: Size {
-                width: self.cell_width,
-                height: self.cell_height,
-            },
-        };
+                let cursor_color = self.palette.resolve(
+                    Color::Named(alacritty_terminal::vte::ansi::NamedColor::Cursor),
+                    colors,
+                );
 
-        window.paint_quad(quad(
-            cursor_bounds,
-            px(0.0),
-            cursor_color,
-            Edges::<Pixels>::default(),
-            transparent_black(),
-            Default::default(),
-        ));
+                let cursor_bounds = Bounds {
+                    origin: Point {
+                        x: cursor_x,
+                        y: cursor_y,
+                    },
+                    size: Size {
+                        width: self.cell_width,
+                        height: self.cell_height,
+                    },
+                };
+
+                window.paint_quad(quad(
+                    cursor_bounds,
+                    px(0.0),
+                    cursor_color,
+                    Edges::<Pixels>::default(),
+                    transparent_black(),
+                    Default::default(),
+                ));
+            }
+        }
     }
 }
 

@@ -1,0 +1,3 @@
+PASS
+timestamp: 2026-03-01T01:34:19+08:00
+detail: tmux capture-pane verified

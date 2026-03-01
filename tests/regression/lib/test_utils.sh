@@ -143,6 +143,19 @@ send_keycode() {
     osascript_cmd "tell application \"System Events\" to tell process \"pmux\" to key code $code"
 }
 
+# 点击 pmux 主内容区（terminal 区域），确保焦点在 terminal 上再发送按键
+click_terminal_area() {
+    osascript_cmd 'tell application "System Events"
+        tell process "pmux"
+            set pos to position of window 1
+            set sz to size of window 1
+            set clickX to round ((item 1 of pos) + (item 1 of sz) * 0.82)
+            set clickY to round ((item 2 of pos) + (item 2 of sz) * 0.55)
+        end tell
+        click at {clickX, clickY}
+    end tell' 2>/dev/null || true
+}
+
 # 性能测试函数
 measure_startup_time() {
     local start_time=$(date +%s.%N)

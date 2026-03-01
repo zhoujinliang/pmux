@@ -252,12 +252,39 @@ def has_multiple_colors(image_path, region, min_colors=3):
         print(f"Error checking colors: {e}", file=sys.stderr)
         return {'has_multiple_colors': False, 'color_count': 0}
 
+def ocr_image(image_path):
+    """
+    使用 tesseract 对图片进行 OCR 识别，返回提取的文字。
+    输出格式（供 shell 解析）:
+      OK:True 或 OK:False
+      TEXT:识别出的文字...
+    """
+    try:
+        result = subprocess.run(
+            ['tesseract', image_path, 'stdout', '-l', 'eng'],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if result.returncode != 0:
+            return {'ok': False, 'text': result.stderr or 'tesseract failed'}
+        return {'ok': True, 'text': (result.stdout or '').strip()}
+    except FileNotFoundError:
+        return {'ok': False, 'text': 'tesseract not found'}
+    except subprocess.TimeoutExpired:
+        return {'ok': False, 'text': 'tesseract timeout'}
+    except Exception as e:
+        return {'ok': False, 'text': str(e)}
+
+
 if __name__ == '__main__':
-    if len(sys.argv) < 3:
+    if len(sys.argv) < 2:
         print("Usage: python3 image_analysis.py <command> <image_path> [args...]")
         print("")
         print("Commands:")
+        print("  ocr <image>                              - OCR extract text (requires tesseract)")
         print("  verify_window <image> [min_w] [min_h]   - Verify pmux window is visible/normal")
+        print("  analyze_region <image> <x> <y> <w> <h>  - Analyze region variance (terminal content check)")
         print("  sidebar_status <image> <x> <y> <w> <h>  - Detect sidebar status color")
         print("  cursor_pos <image> <x> <y> <w> <h>      - Detect cursor in terminal")
         print("  check_colors <image> <x> <y> <w> <h>    - Check for multiple colors")
@@ -265,9 +292,38 @@ if __name__ == '__main__':
         sys.exit(1)
     
     cmd = sys.argv[1]
-    image_path = sys.argv[2]
+    if len(sys.argv) < 3 and cmd != 'ocr':
+        print("Usage: python3 image_analysis.py <command> <image_path> [args...]", file=sys.stderr)
+        sys.exit(1)
+    image_path = sys.argv[2] if len(sys.argv) > 2 else None
 
-    if cmd == 'verify_window':
+    if cmd == 'ocr':
+        if len(sys.argv) < 3:
+            print("Usage: python3 image_analysis.py ocr <image_path>", file=sys.stderr)
+            sys.exit(1)
+        result = ocr_image(sys.argv[2])
+        print(f"OK:{result['ok']}")
+        # TEXT 可能包含换行，用替换保证单行输出便于 grep；实际校验用 OCR_TEXT 变量
+        text_safe = (result['text'] or '').replace('\n', ' ')
+        print(f"TEXT:{text_safe}")
+        sys.exit(0 if result['ok'] else 1)
+
+    if cmd == 'analyze_region':
+        if len(sys.argv) < 7:
+            print("Usage: python3 image_analysis.py analyze_region <image> <x> <y> <w> <h>", file=sys.stderr)
+            sys.exit(1)
+        x, y, w, h = map(int, sys.argv[3:7])
+        result = analyze_region(image_path, x, y, w, h)
+        if result:
+            print(f"VARIANCE:{result['variance']:.1f}")
+            print(f"AVG_R:{result['avg_color'][0]:.0f}")
+            print(f"AVG_G:{result['avg_color'][1]:.0f}")
+            print(f"AVG_B:{result['avg_color'][2]:.0f}")
+        else:
+            print("VARIANCE:0")
+            sys.exit(1)
+
+    elif cmd == 'verify_window':
         min_w = int(sys.argv[3]) if len(sys.argv) > 3 else 400
         min_h = int(sys.argv[4]) if len(sys.argv) > 4 else 300
         result = verify_window(image_path, min_width=min_w, min_height=min_h)

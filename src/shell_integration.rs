@@ -6,34 +6,11 @@
 //! - C: PreExec (command about to run)
 //! - D: PostExec (command finished, with optional exit code)
 //!
-//! ## Cursor Positioning API
+//! ## Cursor Positioning API (ContentExtractor)
 //!
-//! The shell integration layer exposes a foundation for cursor positioning features. These APIs
-//! live on [`crate::terminal::engine::TerminalEngine`]:
-//!
-//! ### `prompt_line()`
-//!
-//! Returns `Option<usize>` — the grid row where the current prompt was emitted. `Some(line)` when
-//! a PromptStart marker (OSC 133;A) has been received; `None` otherwise. The shell emits this
-//! marker at the start of each prompt, so the line reflects where the user's input line begins.
-//!
-//! ### `click_to_prompt(col)`
-//!
-//! Returns `Option<(usize, usize)>` — `(line, col)` for cursor positioning when a prompt line
-//! is known. Used for future UI features such as Alt+Click to move the cursor to a specific
-//! column in the prompt line.
-//!
-//! **Future cursor click feature plan**: When the user Alt+Clicks at column 5 of the prompt line,
-//! the UI will call `engine.click_to_prompt(5)` to obtain the target `(line, col)`, then send
-//! the appropriate cursor positioning input to tmux (e.g., via send-keys or pane selection).
-//!
-//! **Example**:
-//! ```ignore
-//! // User Alt+Clicks at column 5 of the prompt line
-//! if let Some((line, col)) = engine.click_to_prompt(5) {
-//!     // Send cursor move to tmux at (line, col)
-//! }
-//! ```
+//! OSC 133 markers are parsed by [`crate::terminal::content_extractor::ContentExtractor`]
+//! in the status pipeline. Cursor positioning (prompt_line, click_to_prompt) may be implemented
+//! when ContentExtractor exposes prompt line information for future UI features.
 
 use std::time::Instant;
 
@@ -51,7 +28,7 @@ pub enum ShellPhase {
 /// Maximum number of markers to retain (FIFO eviction).
 pub const MAX_MARKERS: usize = 100;
 
-/// Shell state tracked by TerminalEngine.
+/// Shell state tracked by ContentExtractor (OSC 133 parsing).
 #[derive(Debug)]
 pub struct ShellState {
     pub phase: ShellPhase,

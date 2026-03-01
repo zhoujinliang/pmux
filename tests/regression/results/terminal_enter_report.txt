@@ -1,0 +1,9 @@
+Terminal Enter Test Report
+==========================
+Test Time: Sun Mar  1 12:25:06 CST 2026
+
+Screenshots:
+- Before Enter: /Users/matt.chow/workspace/pmux/tests/regression/../results/screenshots/terminal_before_enter_20260301_122502.png (variance: 1371.6)
+- After Enter:  /Users/matt.chow/workspace/pmux/tests/regression/../results/screenshots/terminal_after_enter_20260301_122504.png (variance: 1370.4)
+
+Result: Variance after Enter = 1370.4

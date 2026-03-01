@@ -37,7 +37,7 @@ cargo check
 - **GPUI** - Zed editor's UI framework (native GPU-accelerated UI)
 - **serde** - JSON serialization for config
 - **rfd** - Cross-platform file dialogs
-- **alacritty_terminal** - Terminal rendering
+- **gpui-terminal** - Embedded terminal (VTE via alacritty_terminal internally)
 - **thiserror** - Error handling
 
 ### Key Modules
@@ -46,14 +46,24 @@ cargo check
 - `app_root.rs` - Root GPUI component, manages application state and view switching
 - `sidebar.rs` - Left sidebar showing worktree list
 - `tabbar.rs` - Tab bar for multi-workspace navigation
-- `terminal_view.rs` - Terminal rendering with content polling; uses style-run batching (see terminal_rendering.rs)
-- `terminal_rendering.rs` - Style-run batching: groups consecutive same-style cells into segments; pipeline: Grid → Segments → Elements → GPUI; ~97% element reduction vs per-cell
+- `terminal_view.rs` - Terminal wrapper: GpuiTerminal (embedded gpui_terminal::TerminalView), Error, or Empty placeholder
+- `terminal_area_entity.rs` - Terminal area with split panes; notifies on content changes
 - `new_branch_dialog_ui.rs` - Modal dialog for branch creation
+
+**Terminal Pipeline (`src/terminal/`)**
+- `stream_adapter.rs` - RuntimeReader, RuntimeWriter, tee_output for gpui-terminal Read/Write
+- `content_extractor.rs` - OSC 133 + visible text extraction for StatusPublisher
 
 **State Management**
 - `workspace_manager.rs` - Multi-workspace tab management (add/switch/close tabs)
 - `app_state.rs` - Complete application state for persistence
 - `config.rs` - Configuration persistence (~/.config/pmux/config.json)
+
+**Runtime Backends (`src/runtime/backends/`)**
+- `mod.rs` - Backend factory: resolve_backend(), create_runtime_from_env(), recover_runtime(); default = "local"
+- `local_pty.rs` - LocalPtyAgent (default backend): direct PTY spawn, multi-pane, diff/review
+- `tmux_control_mode.rs` - tmux -CC control mode: ControlModeParser (%output/%begin/%end/%exit), TmuxControlModeRuntime (persistence backend)
+- `tmux.rs` - Legacy TmuxRuntime (pipe-pane + capture-pane), deprecated
 
 **Tmux Integration (`src/tmux/`)**
 - `session.rs` - Tmux session lifecycle management
@@ -67,7 +77,7 @@ cargo check
 
 **Shell Integration (`src/`)**
 - `shell_integration.rs` - OSC 133 parser and shell state (MarkerKind, ShellPhase, ShellMarker, Osc133Parser)
-- Flow: shell emits OSC 133 (A/B/C/D) → TerminalEngine.advance_with_osc133() → ShellState → StatusDetector
+- Flow: shell emits OSC 133 (A/B/C/D) → ContentExtractor.feed() parses via Osc133Parser → ShellPhaseInfo → StatusDetector
 
 **Agent Status Detection (`src/`)**
 - `agent_status.rs` - Agent status enumeration (Running, Waiting, Idle, Error, Unknown) with display properties
@@ -75,7 +85,7 @@ cargo check
 - `StatusPublisher` - Publishes agent state changes via Event Bus (reads from stream/Term buffers; no capture-pane)
 
 **Input Handling**
-- `input_handler.rs` - Forwards keyboard events to tmux sessions
+- `app_root.rs` - handle_key_down forwards keys to runtime.send_input (or gpui_terminal when focused)
 - Keyboard shortcuts intercepted at AppRoot (Cmd+B toggles sidebar)
 
 ## Development Patterns
@@ -120,27 +130,24 @@ impl Render for AppRoot {
 
 ### Shell Integration Flow
 1. Shell (zsh/bash/fish) emits OSC 133 sequences (A=PromptStart, B=PromptEnd, C=PreExec, D=PostExec)
-2. TerminalEngine.advance_with_osc133() parses bytes via Osc133Parser, updates ShellState
-3. StatusDetector.detect_with_shell_phase() uses ShellPhaseInfo when available (Running→Running, PostExec+exit≠0→Error)
+2. ContentExtractor.feed() parses bytes via Osc133Parser, yields ShellPhaseInfo
+3. StatusPublisher.check_status() uses ShellPhaseInfo when available (Running→Running, PostExec+exit≠0→Error)
 4. Fallback: when OSC 133 unavailable, text-based detection (patterns like "thinking", "?") still works
 
 See `docs/shell-integration.md` for user shell configuration.
 
 ### State Flow
 1. AppRoot loads Config on startup
-2. Valid workspace triggers tmux session creation via `start_tmux_session()`
-3. Background polling loops are started:
-   - Terminal content polling (200ms) updates TerminalContent via Arc<Mutex<>>
-   - Status polling (500ms) checks StatusPoller for agent state changes
-   - StatusPoller runs in its own background thread, polling tmux panes
+2. Valid workspace triggers runtime creation (local PTY or tmux via `create_runtime_from_env`)
+3. Terminal pipeline: subscribe_output → tee_output → (RuntimeReader → gpui_terminal, ContentExtractor → StatusPublisher)
 4. When agent status changes:
-   - Status polling loop updates AppRoot's pane_statuses HashMap
-   - AppRoot recomputes StatusCounts
+   - StatusPublisher publishes to EventBus
+   - AppRoot's event subscription updates pane_statuses, StatusCounts
    - cx.notify() triggers UI redraw
    - Sidebar displays updated status icons
    - TopBar displays updated aggregate counts
-5. Keyboard events forwarded to tmux via InputHandler
-6. Workspace switching stops current StatusPoller and starts new one
+5. Keyboard events: gpui_terminal (when focused) or AppRoot handle_key_down → runtime.send_input
+6. Workspace switching stops current runtime and starts new one
 7. All state changes trigger cx.notify() for UI redraw
 
 ## Important Notes
@@ -150,6 +157,6 @@ See `docs/shell-integration.md` for user shell configuration.
 - GPUI is pinned to a specific git commit (rev = "269b03f4") in Cargo.toml
 - The UI uses a dark theme with rgb(0x1e1e1e) as the background color
 - Git repository validation supports normal repos, bare repos, and worktrees
-- Agent status detection uses background polling (500ms) with debouncing to avoid UI flicker
+- Agent status detection uses event-driven StatusPublisher (triggered by ContentExtractor on terminal output) with debouncing
 - Shell integration (OSC 133) improves status accuracy when enabled in user's shell; see docs/shell-integration.md
-- Status updates propagate from StatusPoller → AppRoot HashMap → Sidebar/TopBar via cx.notify()
+- Status updates propagate from StatusPublisher → EventBus → AppRoot → Sidebar/TopBar via cx.notify()

@@ -716,6 +716,17 @@ impl TerminalView {
     /// to the stdin writer. If a key handler is set and returns true, the event
     /// is consumed and not sent to the terminal.
     fn on_key_down(&mut self, event: &KeyDownEvent, _window: &mut Window, _cx: &mut Context<Self>) {
+        // #region agent log
+        {
+            let log_path = "/Users/matt.chow/workspace/pmux/.cursor/debug-df34ba.log";
+            let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0);
+            let entry = format!("{{\"sessionId\":\"df34ba\",\"location\":\"view.rs:on_key_down\",\"message\":\"gpui_terminal received key\",\"data\":{{\"key\":\"{}\"}},\"hypothesisId\":\"H5\",\"timestamp\":{}}}", event.keystroke.key, ts);
+            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(log_path) {
+                let _ = std::io::Write::write_all(&mut f, entry.as_bytes());
+                let _ = std::io::Write::write_all(&mut f, b"\n");
+            }
+        }
+        // #endregion
         // Check if key handler wants to consume this event
         if let Some(ref handler) = self.key_handler
             && handler(event)
@@ -782,13 +793,34 @@ impl TerminalView {
     /// Currently a placeholder for future scrollback support.
     fn on_scroll(
         &mut self,
-        _event: &ScrollWheelEvent,
+        event: &ScrollWheelEvent,
         _window: &mut Window,
-        _cx: &mut Context<Self>,
+        cx: &mut Context<Self>,
     ) {
-        // TODO: Implement scrollback
-        // - Scroll the terminal display up/down
-        // - Send scroll reports if alternate screen is not active
+        use alacritty_terminal::grid::Scroll;
+        use alacritty_terminal::term::TermMode;
+
+        let term_arc = self.state.term_arc();
+        let mut term = term_arc.lock();
+
+        if term.mode().contains(TermMode::ALT_SCREEN) {
+            return;
+        }
+
+        let lines = match event.delta {
+            ScrollDelta::Lines(pt) => pt.y as i32,
+            ScrollDelta::Pixels(pt) => {
+                let cell_height: f32 = self.renderer.cell_height.into();
+                let py: f32 = pt.y.into();
+                if cell_height > 0.0 { (py / cell_height) as i32 } else { 0 }
+            }
+        };
+
+        if lines != 0 {
+            term.scroll_display(Scroll::Delta(-lines));
+            drop(term);
+            cx.notify();
+        }
     }
 
     /// Process pending terminal events.

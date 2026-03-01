@@ -21,6 +21,9 @@ pub fn key_to_xterm_escape(key: &str, modifiers: KeyModifiers) -> Option<Vec<u8>
     }
 
     let bytes = match key {
+        // Standard terminal: Enter sends \r. PTY line discipline (ICRNL) or shell (zsh ^M)
+        // handles CR→NL conversion. \r\n caused double accept-line → screen clear.
+        // Bug2 (\r\n) was a tmux pipe-pane workaround; local PTY doesn't need it.
         "enter" | "return" => vec![b'\r'],
         "backspace" => vec![0x7f],
         "escape" => vec![0x1b],

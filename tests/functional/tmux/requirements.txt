@@ -1,0 +1,2 @@
+# Tmux integration tests - ref: pytest-tmux, tmux-test patterns
+pytest>=7.0

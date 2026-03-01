@@ -130,7 +130,30 @@ impl LocalPtyAgent {
                         while let Ok(bytes) = input_rx.try_recv() {
                             buffer.extend_from_slice(&bytes);
                         }
+                        // #region agent log
+                        {
+                            let has_cr = buffer.contains(&b'\r');
+                            let has_nl = buffer.contains(&b'\n');
+                            if has_cr || has_nl {
+                                let preview = if buffer.len() <= 30 { format!("{:?}", &buffer) } else { format!("{:?}...", &buffer[..30]) };
+                                crate::debug_log::dbg_session_log(
+                                    "local_pty.rs:writer_thread",
+                                    "writing to PTY (contains CR/NL)",
+                                    &serde_json::json!({"len": buffer.len(), "has_cr": has_cr, "has_nl": has_nl, "preview": preview}),
+                                    "H6",
+                                );
+                            }
+                        }
+                        // #endregion
                         if writer.write_all(&buffer).is_err() || writer.flush().is_err() {
+                            // #region agent log
+                            crate::debug_log::dbg_session_log(
+                                "local_pty.rs:writer_thread",
+                                "PTY write/flush error",
+                                &serde_json::json!({}),
+                                "H6",
+                            );
+                            // #endregion
                             break;
                         }
                         buffer.clear();

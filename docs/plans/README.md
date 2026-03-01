@@ -51,6 +51,20 @@
 
 **路线 B**：参考 [2026-02-28-route-b-zed-style-entity-split-brainstorm.md](2026-02-28-route-b-zed-style-entity-split-brainstorm.md)
 
+## Local PTY Default + tmux Control Mode
+
+| 计划 | 目标 | 预估 |
+|------|------|------|
+| [2026-03-01-local-pty-default-and-control-mode.md](2026-03-01-local-pty-default-and-control-mode.md) | Phase 1: local PTY 默认（消除 pipe-pane/capture-pane 问题）；Phase 2: tmux -CC control mode 持久化 | Phase 1: 3-5 天, Phase 2: 2-3 周 |
+
+## gpui-terminal 重构
+
+| 计划 | 目标 | 预估 |
+|------|------|------|
+| [2026-03-01-gpui-terminal-refactor-default-tmux.md](2026-03-01-gpui-terminal-refactor-default-tmux.md) | 用 gpui-terminal 替换自建终端管线；默认 backend 改为 tmux；Stream 适配器 (RuntimeReader/Writer/TeePipe)；ContentExtractor | 5~8 天 |
+
+**参考:** [2026-03-gpui-terminal-refactor-default-tmux.md](2026-03-gpui-terminal-refactor-default-tmux.md)（brainstorming 方案）
+
 ## 历史计划
 
 - [2026-02-25-spec2-implementation.md](2026-02-25-spec2-implementation.md) — Sidebar + Terminal 实现

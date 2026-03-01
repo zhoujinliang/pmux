@@ -1,98 +1,28 @@
 // ui/terminal_view.rs - Terminal view component with GPUI render
-// Renders via TerminalElement (Zed-style) or legacy div for Error buffer.
-use crate::terminal::{RenderableSnapshot, TerminalEngine};
-use crate::ui::terminal_element::TerminalElement;
-use crate::ui::terminal_renderer::{build_frame, RenderableGrid, RowCache, ShapedLineCache};
-use crate::ui::terminal_rendering::{
-    group_cells_into_segments, hash_row_content, render_batch_row, StyledSegment,
-};
-use alacritty_terminal::term::cell::Flags;
+// Renders via gpui-terminal (GpuiTerminal), simple div for Error, or placeholder for Empty.
 use gpui::prelude::*;
 use gpui::*;
-use lru::LruCache;
-use std::cell::RefCell;
-use std::num::NonZeroUsize;
-use std::rc::Rc;
-use std::sync::{Arc, Mutex};
 
-/// Default row cache size (Task 4.4). Configurable via config in future.
-pub const DEFAULT_ROW_CACHE_SIZE: usize = 200;
-
-/// Content source for TerminalView - streaming (TerminalEngine) or error placeholder (Error).
+/// Content source for TerminalView - gpui-terminal, error placeholder, or empty.
 #[derive(Clone)]
 pub enum TerminalBuffer {
+    /// Placeholder when pane has no buffer yet (gray bg, "—")
+    Empty,
     /// Error: static message when streaming unavailable (no screen snapshot)
     Error(String),
-    /// Streaming: TerminalEngine (byte processor with is_tui_active) + row cache for rendering optimization
-    Term(
-        Arc<TerminalEngine>,
-        Arc<Mutex<LruCache<u64, Vec<StyledSegment>>>>,
-    ),
-}
-
-fn extract_text_from_display_iter<'a>(
-    display_iter: impl Iterator<
-        Item = alacritty_terminal::grid::Indexed<&'a alacritty_terminal::term::cell::Cell>,
-    >,
-) -> String {
-    let mut lines: Vec<String> = Vec::new();
-    let mut current_line = String::new();
-    let mut current_row: i32 = i32::MIN;
-    for indexed in display_iter {
-        if indexed.cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
-            continue;
-        }
-        let row = indexed.point.line.0;
-        if row != current_row {
-            if !current_line.is_empty() {
-                lines.push(current_line.trim_end().to_string());
-            }
-            current_line = String::new();
-            current_row = row;
-        }
-        current_line.push(indexed.cell.c);
-    }
-    if !current_line.is_empty() {
-        lines.push(current_line.trim_end().to_string());
-    }
-    lines.join("\n")
+    /// gpui-terminal: embedded TerminalView entity (tee_output → RuntimeReader + ContentExtractor pipeline)
+    GpuiTerminal(gpui::Entity<gpui_terminal::TerminalView>),
 }
 
 impl TerminalBuffer {
-    /// Create a Term buffer with row cache. Use for new panes.
-    /// `cache_size`: LRU capacity, default 200. Uses config.terminal_row_cache_size when set.
-    pub fn new_term(engine: TerminalEngine) -> Self {
-        Self::new_term_with_cache_size(Arc::new(engine), DEFAULT_ROW_CACHE_SIZE)
-    }
-
-    /// Create a Term buffer with configurable row cache size.
-    /// Accepts Arc<TerminalEngine> so the same engine can be used for byte processing (e.g. advance_bytes) and rendering.
-    pub fn new_term_with_cache_size(engine: Arc<TerminalEngine>, cache_size: usize) -> Self {
-        let cap = NonZeroUsize::new(cache_size.max(1)).unwrap_or(NonZeroUsize::new(1).unwrap());
-        Self::Term(engine, Arc::new(Mutex::new(LruCache::new(cap))))
-    }
-
-    /// Create an empty Term buffer (no byte stream). Use for placeholders when pane has no buffer yet.
-    pub fn new_empty_term(cols: usize, rows: usize) -> Self {
-        let (_tx, rx) = flume::unbounded();
-        let engine = TerminalEngine::new(cols, rows, rx);
-        Self::new_term_with_cache_size(Arc::new(engine), DEFAULT_ROW_CACHE_SIZE)
-    }
-
-    /// Extract text for status detection. Source: stream (Term) only—never capture-pane.
-    /// Uses try_renderable_content to avoid blocking.
+    /// Extract text for status detection.
+    /// GpuiTerminal: returns None (status is published from ContentExtractor background task).
+    /// Empty: returns None. Error: returns Some(msg).
     pub fn content_for_status_detection(&self) -> Option<String> {
         match self {
-            TerminalBuffer::Term(engine, _) => {
-                // try_renderable_content returns Option<String>;
-                // None means lock failed (advance_bytes thread has the lock)
-                engine.try_renderable_content(
-                    |_content, display_iter, _screen_lines, _cols, _display_offset| {
-                        extract_text_from_display_iter(display_iter)
-                    },
-                )
-            }
+            TerminalBuffer::Empty => None,
             TerminalBuffer::Error(s) => Some(s.clone()),
+            TerminalBuffer::GpuiTerminal(_) => None,
         }
     }
 }
@@ -103,14 +33,8 @@ pub struct TerminalView {
     title: String,
     buffer: TerminalBuffer,
     scroll_offset: usize,
-    /// When true, show a blinking cursor at end of last line (indicates ready for input)
     is_focused: bool,
-    /// When true (and focused), cursor is visible; when false, hidden (blink off phase)
     cursor_visible: bool,
-    /// Cross-frame row cache, shared via Rc<RefCell<>> to persist across renders.
-    row_cache: Rc<RefCell<RowCache>>,
-    /// Rc allows cache to persist in element tree after TerminalView is consumed by RenderOnce.
-    shaped_line_cache: Rc<RefCell<ShapedLineCache<gpui::ShapedLine>>>,
 }
 
 impl TerminalView {
@@ -118,32 +42,14 @@ impl TerminalView {
         Self {
             pane_id: pane_id.to_string(),
             title: title.to_string(),
-            buffer: TerminalBuffer::new_empty_term(80, 24),
+            buffer: TerminalBuffer::Empty,
             scroll_offset: 0,
             is_focused: false,
             cursor_visible: true,
-            row_cache: Rc::new(RefCell::new(RowCache::new(DEFAULT_ROW_CACHE_SIZE))),
-            shaped_line_cache: Rc::new(RefCell::new(ShapedLineCache::new(1000))),
         }
     }
 
-    /// Create with TerminalEngine (for pipe-pane / control mode streaming)
-    pub fn with_engine(pane_id: &str, title: &str, engine: Arc<TerminalEngine>) -> Self {
-        let cap =
-            NonZeroUsize::new(DEFAULT_ROW_CACHE_SIZE).unwrap_or(NonZeroUsize::new(1).unwrap());
-        Self {
-            pane_id: pane_id.to_string(),
-            title: title.to_string(),
-            buffer: TerminalBuffer::Term(engine, Arc::new(Mutex::new(LruCache::new(cap)))),
-            scroll_offset: 0,
-            is_focused: false,
-            cursor_visible: true,
-            row_cache: Rc::new(RefCell::new(RowCache::new(DEFAULT_ROW_CACHE_SIZE))),
-            shaped_line_cache: Rc::new(RefCell::new(ShapedLineCache::new(1000))),
-        }
-    }
-
-    /// Create with a TerminalBuffer (Legacy or Term)
+    /// Create with a TerminalBuffer (GpuiTerminal, Error, or Empty)
     pub fn with_buffer(pane_id: &str, title: &str, buffer: TerminalBuffer) -> Self {
         Self {
             pane_id: pane_id.to_string(),
@@ -152,18 +58,16 @@ impl TerminalView {
             scroll_offset: 0,
             is_focused: false,
             cursor_visible: true,
-            row_cache: Rc::new(RefCell::new(RowCache::new(DEFAULT_ROW_CACHE_SIZE))),
-            shaped_line_cache: Rc::new(RefCell::new(ShapedLineCache::new(1000))),
         }
     }
 
-    /// Set whether this pane is focused (shows cursor when true)
+    /// Set whether this pane is focused
     pub fn with_focused(mut self, focused: bool) -> Self {
         self.is_focused = focused;
         self
     }
 
-    /// Set cursor visibility (for blink: true=on, false=off)
+    /// Set cursor visibility (for blink)
     pub fn with_cursor_visible(mut self, visible: bool) -> Self {
         self.cursor_visible = visible;
         self
@@ -188,152 +92,24 @@ impl TerminalView {
         self.scroll_offset = 0;
     }
 
-    fn should_show_cursor(&self) -> bool {
-        let tui_active = match &self.buffer {
-            TerminalBuffer::Term(engine, _) => engine.is_tui_active(),
-            TerminalBuffer::Error(_) => false,
-        };
-        !tui_active && self.is_focused && self.cursor_visible
-    }
-
-    #[cfg(test)]
-    pub fn test_should_show_cursor(&self) -> bool {
-        self.should_show_cursor()
-    }
-
-    fn render_error(&self, msg: &str) -> Vec<AnyElement> {
+    fn render_error(&self, msg: &str) -> impl IntoElement {
         let lines: Vec<String> = msg.lines().map(|s| s.to_string()).collect();
         let count = lines.len();
         let lines_to_show = 50;
         let start_idx = count.saturating_sub(lines_to_show + self.scroll_offset);
         let end_idx = count.saturating_sub(self.scroll_offset);
-        let visible: Vec<String> = lines.get(start_idx..end_idx).unwrap_or(&[]).to_vec();
-        visible
-            .iter()
-            .map(|line_text| {
+        let visible: Vec<&String> = lines.get(start_idx..end_idx).unwrap_or(&[]).iter().collect();
+        div()
+            .flex()
+            .flex_col()
+            .children(visible.into_iter().map(|line_text| {
                 let text: String = if line_text.is_empty() {
                     " ".into()
                 } else {
                     line_text.clone()
                 };
-                render_batch_row(
-                    vec![crate::ui::terminal_rendering::StyledSegment {
-                        text,
-                        fg: alacritty_terminal::vte::ansi::Rgb {
-                            r: 0xab,
-                            g: 0xb2,
-                            b: 0xbf,
-                        },
-                        bg: alacritty_terminal::vte::ansi::Rgb {
-                            r: 0x28,
-                            g: 0x2c,
-                            b: 0x34,
-                        },
-                        flags: Flags::empty(),
-                    }],
-                    None,
-                    false,
-                )
-            })
-            .collect()
-    }
-
-    /// Renders visible terminal rows from display_iter with viewport culling and row-level caching.
-    ///
-    /// **Pipeline**: (1) Viewport culling: only rows in [visible_start, visible_end) are collected.
-    /// (2) For each visible row: group cells into segments via `group_cells_into_segments()`.
-    /// (3) Cache: non-cursor rows are cached by content hash; cache hits skip segment rebuild.
-    /// (4) Each row → `render_batch_row()` → one flex row element. Cursor row is not cached
-    /// (cursor position changes frequently).
-    #[allow(dead_code)] // Legacy path; Term now uses build_frame + TerminalElement
-    fn render_from_display_iter<'a>(
-        &self,
-        content: &alacritty_terminal::term::RenderableContent<'_>,
-        display_iter: impl Iterator<
-            Item = alacritty_terminal::grid::Indexed<&'a alacritty_terminal::term::cell::Cell>,
-        >,
-        screen_lines: usize,
-        cache: &mut LruCache<u64, Vec<StyledSegment>>,
-    ) -> Vec<AnyElement> {
-        let visible_start = self.scroll_offset;
-        let visible_end = visible_start.saturating_add(screen_lines);
-
-        let mut row_cells: Vec<
-            Vec<alacritty_terminal::grid::Indexed<&'a alacritty_terminal::term::cell::Cell>>,
-        > = Vec::new();
-        let mut current_row_cells: Vec<
-            alacritty_terminal::grid::Indexed<&'a alacritty_terminal::term::cell::Cell>,
-        > = Vec::new();
-        let mut current_row: i32 = i32::MIN;
-        let mut viewport_line: usize = 0;
-
-        for indexed in display_iter {
-            if indexed.cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
-                continue;
-            }
-            let row = indexed.point.line.0 as i32;
-
-            if row != current_row {
-                if !current_row_cells.is_empty() {
-                    if visible_start <= viewport_line && viewport_line < visible_end {
-                        row_cells.push(std::mem::take(&mut current_row_cells));
-                    } else {
-                        current_row_cells.clear();
-                    }
-                }
-                if current_row != i32::MIN {
-                    viewport_line = viewport_line.saturating_add(1);
-                }
-                current_row = row;
-            }
-
-            if visible_start <= viewport_line && viewport_line < visible_end {
-                current_row_cells.push(indexed);
-            }
-        }
-
-        if !current_row_cells.is_empty()
-            && visible_start <= viewport_line
-            && viewport_line < visible_end
-        {
-            row_cells.push(current_row_cells);
-        }
-
-        let cursor_line = content.cursor.point.line.0;
-        let cursor_col = content.cursor.point.column.0;
-        let show_cursor = self.should_show_cursor();
-        let result: Vec<AnyElement> = row_cells
-            .into_iter()
-            .enumerate()
-            .map(|(_idx, cells)| {
-                let row_line = cells.first().map(|c| c.point.line.0).unwrap_or(0);
-                let is_cursor_row = row_line == cursor_line;
-
-                let segments = group_cells_into_segments(cells.into_iter(), content.colors);
-
-                let cursor = if show_cursor && is_cursor_row {
-                    Some(cursor_col)
-                } else {
-                    None
-                };
-                let show_cursor_on_row = show_cursor && is_cursor_row;
-
-                // Task 4.3: cache non-cursor rows (cursor row changes frequently)
-                if !show_cursor_on_row {
-                    let content_hash = hash_row_content(&segments);
-                    if let Some(cached_segments) = cache.get(&content_hash) {
-                        return render_batch_row(cached_segments.clone(), None, false);
-                    }
-                    cache.put(content_hash, segments.clone());
-                }
-
-                let row = render_batch_row(segments, cursor, show_cursor_on_row);
-
-                row
-            })
-            .collect();
-
-        result
+                div().child(text)
+            }))
     }
 }
 
@@ -347,49 +123,22 @@ impl IntoElement for TerminalView {
 impl RenderOnce for TerminalView {
     fn render(self, _window: &mut Window, _cx: &mut App) -> impl IntoElement {
         let content_elem: AnyElement = match &self.buffer {
-            TerminalBuffer::Error(msg) => {
-                let line_elements = self.render_error(msg);
-                div().children(line_elements).into_any()
+            TerminalBuffer::GpuiTerminal(entity) => {
+                div().size_full().child(entity.clone()).into_any_element()
             }
-            TerminalBuffer::Term(engine, _) => {
-                let result = engine.try_renderable_content(
-                    |content, display_iter, screen_lines, cols, display_offset| {
-                        RenderableSnapshot::from(
-                            content,
-                            display_iter,
-                            screen_lines,
-                            cols,
-                            display_offset,
-                        )
-                    },
-                );
-                let cursor_visible = self.should_show_cursor();
-                let shaped_line_cache = Rc::clone(&self.shaped_line_cache);
-                let (grid, cols, screen_lines) = match result {
-                    Some(snapshot) => {
-                        let mut row_cache_guard = self.row_cache.borrow_mut();
-                        let grid = build_frame(
-                            &snapshot,
-                            &mut *row_cache_guard,
-                            &mut *shaped_line_cache.borrow_mut(),
-                            cursor_visible,
-                            None, // visible_col_range: all columns
-                        );
-                        (grid, snapshot.cols, snapshot.rows)
-                    }
-                    None => (RenderableGrid::empty(80, 24), 80, 24),
-                };
-                let cell_w = px(8.0);
-                let cell_h = px(16.0);
-                TerminalElement::new(
-                    grid,
-                    cols,
-                    screen_lines,
-                    cell_w,
-                    cell_h,
-                    Some(shaped_line_cache),
-                )
-                .into_any()
+            TerminalBuffer::Error(msg) => {
+                self.render_error(msg).into_any_element()
+            }
+            TerminalBuffer::Empty => {
+                div()
+                    .size_full()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .bg(rgb(0x2e343e))
+                    .text_color(rgb(0x6d6d6d))
+                    .child("—")
+                    .into_any_element()
             }
         };
 
@@ -481,42 +230,7 @@ mod tests {
     }
 
     #[test]
-    fn test_cursor_hidden_when_tui_active() {
-        // Enter alternate screen (vim/neovim)
-        let (tx, rx) = flume::unbounded();
-        let engine_tui = Arc::new(TerminalEngine::new(80, 24, rx));
-        tx.send(b"\x1b[?1049h".to_vec()).unwrap();
-        engine_tui.advance_bytes();
-        drop(tx);
-        let buffer = TerminalBuffer::new_term_with_cache_size(engine_tui, DEFAULT_ROW_CACHE_SIZE);
-        let view = TerminalView::with_buffer("pane-1", "vim", buffer)
-            .with_focused(true)
-            .with_cursor_visible(true);
-        assert!(
-            !view.test_should_show_cursor(),
-            "cursor should be hidden when TUI (alt screen) is active"
-        );
-    }
-
-    #[test]
-    fn test_cursor_shows_when_normal_shell() {
-        let view = TerminalView::new("pane-1", "zsh")
-            .with_focused(true)
-            .with_cursor_visible(true);
-        assert!(
-            view.test_should_show_cursor(),
-            "cursor should show when focused in normal shell"
-        );
-    }
-
-    #[test]
-    fn test_cursor_hidden_when_not_focused() {
-        let view = TerminalView::new("pane-1", "zsh")
-            .with_focused(false)
-            .with_cursor_visible(true);
-        assert!(
-            !view.test_should_show_cursor(),
-            "cursor should be hidden when pane not focused"
-        );
+    fn test_buffer_empty_returns_none() {
+        assert_eq!(TerminalBuffer::Empty.content_for_status_detection(), None);
     }
 }

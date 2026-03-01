@@ -1,16 +1,6 @@
-// terminal/mod.rs - Terminal emulation bridge for alacritty_terminal
-pub mod bounds;
-pub mod cursor_coords;
-pub mod engine;
-pub mod pty_reader;
-pub mod pty_writer;
-pub mod renderable_snapshot;
-pub mod term_bridge;
+// terminal/mod.rs - Terminal stream adapters for gpui-terminal
+pub mod content_extractor;
+pub mod stream_adapter;
 
-pub use bounds::TerminalBounds;
-pub use cursor_coords::{LogicalCursor, TmuxCursor, VisualCursor};
-pub use engine::TerminalEngine;
-pub use renderable_snapshot::{RenderableSnapshot, RowData};
-pub use pty_reader::{spawn_pty_reader, spawn_pty_reader_with_handle, PtyReaderHandle};
-pub use pty_writer::PtyWriter;
-pub use term_bridge::{StyledCell, TermBridge, RenderableContent, RenderableCursor};
+pub use content_extractor::ContentExtractor;
+pub use stream_adapter::{RuntimeReader, RuntimeWriter, tee_output};

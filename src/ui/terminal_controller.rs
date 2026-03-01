@@ -61,6 +61,22 @@ impl ResizeController {
     pub fn is_pending(&self) -> bool {
         self.pending
     }
+
+    /// Reset cached dimensions so next maybe_resize returns Some.
+    /// Call when switching worktrees so new terminal engines get resized to window bounds.
+    pub fn reset_for_new_session(&mut self) {
+        self.last_cols = None;
+        self.last_rows = None;
+    }
+
+    /// Last dimensions used for resize. Used to initialize new engines so they render full-size
+    /// immediately (avoids half-screen→full-screen flash when switching worktrees).
+    pub fn last_dims(&self) -> Option<(u16, u16)> {
+        match (self.last_cols, self.last_rows) {
+            (Some(c), Some(r)) => Some((c, r)),
+            _ => None,
+        }
+    }
 }
 
 impl Default for ResizeController {

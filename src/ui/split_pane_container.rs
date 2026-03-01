@@ -194,12 +194,12 @@ impl SplitPaneContainer {
                 let buffer = terminal_buffers
                     .get(target)
                     .cloned()
-                    .unwrap_or_else(|| TerminalBuffer::new_empty_term(80, 24));
+                    .unwrap_or(TerminalBuffer::Empty);
                 let title = self.pane_title(target);
                 let is_focused = pane_index_offset == focused_pane_index;
                 let pane_idx = pane_index_offset;
                 let on_click = on_pane_click.clone();
-                div()
+                let pane_div = div()
                     .flex_1()
                     .min_w(px(0.))
                     .min_h(px(0.))
@@ -211,14 +211,21 @@ impl SplitPaneContainer {
                         if let Some(ref cb) = on_click {
                             cb(pane_idx, window, cx);
                         }
-                    })
-                    .child(
-                        TerminalView::with_buffer(target, &title, buffer)
-                            .with_focused(is_focused)
-                            .with_cursor_visible(cursor_blink_visible)
-                            .into_element()
-                    )
-                    .into_any_element()
+                    });
+                // GpuiTerminal: render entity directly. Error/Empty: use TerminalView wrapper.
+                let content = if let TerminalBuffer::GpuiTerminal(entity) = &buffer {
+                    pane_div.child(entity.clone()).into_any_element()
+                } else {
+                    pane_div
+                        .child(
+                            TerminalView::with_buffer(target, &title, buffer.clone())
+                                .with_focused(is_focused)
+                                .with_cursor_visible(cursor_blink_visible)
+                                .into_element(),
+                        )
+                        .into_any_element()
+                };
+                content
             }
             SplitNode::Vertical { ratio, left, right } => {
                 let r = ratio.clamp(SplitNode::MIN_RATIO, SplitNode::MAX_RATIO);

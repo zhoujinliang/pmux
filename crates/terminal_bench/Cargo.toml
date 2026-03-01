@@ -7,8 +7,6 @@ publish = false
 [dependencies]
 alacritty_terminal = "0.25.1"
 vte = "0.15"
-pmux = { path = "../.." }
-lru = "0.12"
 
 [dev-dependencies]
 criterion = "0.5"

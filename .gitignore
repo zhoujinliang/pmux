@@ -60,8 +60,9 @@ config.json
 *.local.json
 secrets.json
 
-# Python venv for icon generation
+# Python venv
 .venv-icon/
+.venv-tmux-test/
 venv/
 .venv/
 

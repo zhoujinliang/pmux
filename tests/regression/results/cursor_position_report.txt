@@ -1,18 +1,18 @@
 Cursor Position Detection Report
 =================================
-Test Time: Sat Feb 28 18:09:35 CST 2026
+Test Time: Sun Mar  1 16:51:26 CST 2026
 
 Screenshots:
-1. Basic: /Users/matt.chow/workspace/pmux/tests/regression/../results/screenshots/cursor_basic_20260228_180931.png
+1. Basic: /Users/matt.chow/workspace/pmux/tests/regression/../results/screenshots/cursor_basic_20260301_165122.png
    Cursor: (, )
 
-2. After 'hello': /Users/matt.chow/workspace/pmux/tests/regression/../results/screenshots/cursor_after_hello_20260228_180932.png
+2. After 'hello': /Users/matt.chow/workspace/pmux/tests/regression/../results/screenshots/cursor_after_hello_20260301_165123.png
    Cursor: (, )
 
-3. After '/': /Users/matt.chow/workspace/pmux/tests/regression/../results/screenshots/cursor_slash_20260228_180934.png
+3. After '/': /Users/matt.chow/workspace/pmux/tests/regression/../results/screenshots/cursor_slash_20260301_165125.png
    Cursor: (, )
 
-4. After '/clear': /Users/matt.chow/workspace/pmux/tests/regression/../results/screenshots/cursor_slash_clear_20260228_180935.png
+4. After '/clear': /Users/matt.chow/workspace/pmux/tests/regression/../results/screenshots/cursor_slash_clear_20260301_165126.png
    Cursor: (, )
 
 Analysis:
