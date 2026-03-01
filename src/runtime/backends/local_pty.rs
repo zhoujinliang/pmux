@@ -40,8 +40,7 @@ pub struct LocalPtyRuntime {
 }
 
 /// Local PTY Agent - manages multiple panes for a single worktree.
-/// Each pane has its own PTY and shell process. (WIP: not yet integrated)
-#[allow(dead_code)]
+/// Each pane has its own PTY and shell process.
 pub struct LocalPtyAgent {
     worktree_path: std::path::PathBuf,
     panes: Mutex<HashMap<PaneId, Arc<LocalPtyPane>>>,
@@ -50,7 +49,6 @@ pub struct LocalPtyAgent {
     rows: u16,
 }
 
-#[allow(dead_code)]
 impl LocalPtyAgent {
     /// Create a new LocalPtyAgent for the given worktree.
     /// Initializes with a single primary pane.
@@ -187,10 +185,9 @@ impl AgentRuntime for LocalPtyAgent {
         let pane = self
             .get_pane(pane_id)
             .ok_or_else(|| RuntimeError::PaneNotFound(pane_id.clone()))?;
-        let result = pane.input_tx
+        pane.input_tx
             .send(bytes.to_vec())
-            .map_err(|e| RuntimeError::Backend(e.to_string()));
-        result
+            .map_err(|e| RuntimeError::Backend(e.to_string()))
     }
 
     fn send_key(&self, pane_id: &PaneId, key: &str, _use_literal: bool) -> Result<(), RuntimeError> {
@@ -580,6 +577,16 @@ mod tests {
         let panes = agent.list_panes(&String::new());
         assert_eq!(panes.len(), 2);
         assert!(panes.contains(&new_pane));
+    }
+
+    #[test]
+    fn test_create_runtime_returns_local_pty_agent() {
+        let dir = tempfile::tempdir().unwrap();
+        let rt = super::super::create_runtime(dir.path(), 80, 24).unwrap();
+        // LocalPtyAgent supports split_pane; LocalPtyRuntime does not
+        let primary = rt.primary_pane_id().unwrap();
+        let result = rt.split_pane(&primary, true);
+        assert!(result.is_ok(), "production runtime should support split_pane, got: {:?}", result);
     }
 
     #[test]
