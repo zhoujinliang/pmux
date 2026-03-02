@@ -197,6 +197,63 @@ pub struct SearchMatch {
     pub len: usize,
 }
 
+/// A detected URL in the terminal grid
+#[derive(Debug, Clone)]
+pub struct DetectedLink {
+    pub line: i32,
+    pub col: usize,
+    pub len: usize,
+    pub url: String,
+}
+
+impl Terminal {
+    /// Detect http/https URLs in the visible terminal grid.
+    pub fn detect_links(&self) -> Vec<DetectedLink> {
+        self.with_content(|term| {
+            use alacritty_terminal::grid::Dimensions;
+            use alacritty_terminal::index::{Column, Line, Point};
+            let grid = term.grid();
+            let screen_lines = grid.screen_lines();
+            let cols = grid.columns();
+            let display_offset = grid.display_offset() as i32;
+            let mut links = Vec::new();
+
+            for row in 0..screen_lines {
+                let mut line_text = String::with_capacity(cols);
+                let line = Line(row as i32 - display_offset);
+                for col in 0..cols {
+                    let cell = &grid[Point { line, column: Column(col) }];
+                    line_text.push(cell.c);
+                }
+                let mut start = 0;
+                while let Some(pos) = line_text[start..].find("http") {
+                    let abs = start + pos;
+                    if line_text[abs..].starts_with("http://") || line_text[abs..].starts_with("https://") {
+                        let url_end = line_text[abs..]
+                            .find(|c: char| c.is_whitespace())
+                            .map(|p| abs + p)
+                            .unwrap_or(line_text.len());
+                        let url = line_text[abs..url_end].to_string();
+                        links.push(DetectedLink {
+                            line: row as i32,
+                            col: abs,
+                            len: url.len(),
+                            url,
+                        });
+                        start = url_end;
+                    } else {
+                        start = abs + 4;
+                    }
+                    if start >= line_text.len() {
+                        break;
+                    }
+                }
+            }
+            links
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

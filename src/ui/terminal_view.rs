@@ -158,12 +158,14 @@ impl RenderOnce for TerminalView {
                         matches.len().checked_sub(1)
                     }
                 });
+                let links = terminal.detect_links();
                 let mut elem = TerminalElement::new(
                     terminal.clone(),
                     focus_handle.clone(),
                     ColorPalette::default(),
                 )
-                .with_search(matches, search_current);
+                .with_search(matches, search_current)
+                .with_links(links, None);
                 if let Some(cb) = resize_callback {
                     let cb = cb.clone();
                     elem = elem.with_resize_callback(move |cols, rows| cb(cols, rows));

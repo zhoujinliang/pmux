@@ -1,7 +1,7 @@
 //! Custom GPUI Element for rendering a terminal grid.
 
 use crate::terminal::colors::ColorPalette;
-use crate::terminal::terminal_core::{SearchMatch, Terminal, TerminalSize};
+use crate::terminal::terminal_core::{DetectedLink, SearchMatch, Terminal, TerminalSize};
 use crate::terminal::terminal_rendering::{BatchedTextRun, LayoutRect, is_default_bg};
 use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::index::{Column, Line, Point as AlacPoint};
@@ -18,6 +18,8 @@ pub struct TerminalElement {
     style: StyleRefinement,
     search_matches: Vec<SearchMatch>,
     search_current: Option<usize>,
+    links: Vec<DetectedLink>,
+    hovered_link: Option<usize>,
 }
 
 impl TerminalElement {
@@ -30,6 +32,8 @@ impl TerminalElement {
             style: StyleRefinement::default(),
             search_matches: Vec::new(),
             search_current: None,
+            links: Vec::new(),
+            hovered_link: None,
         }
     }
 
@@ -41,6 +45,12 @@ impl TerminalElement {
     pub fn with_search(mut self, matches: Vec<SearchMatch>, current: Option<usize>) -> Self {
         self.search_matches = matches;
         self.search_current = current;
+        self
+    }
+
+    pub fn with_links(mut self, links: Vec<DetectedLink>, hovered: Option<usize>) -> Self {
+        self.links = links;
+        self.hovered_link = hovered;
         self
     }
 }
@@ -355,6 +365,29 @@ impl Element for TerminalElement {
                 Bounds::new(
                     Point::new(match_x, match_y),
                     Size::new(px(m.len as f32 * cell_width_f), line_height),
+                ),
+                px(0.0),
+                color,
+                Edges::default(),
+                transparent_black(),
+                Default::default(),
+            ));
+        }
+
+        // Paint URL underlines
+        for (idx, link) in self.links.iter().enumerate() {
+            let is_hovered = self.hovered_link == Some(idx);
+            let color = if is_hovered {
+                Hsla { h: 0.55, s: 0.8, l: 0.7, a: 1.0 }
+            } else {
+                Hsla { h: 0.55, s: 0.6, l: 0.5, a: 0.6 }
+            };
+            let link_x = origin.x + px(link.col as f32 * cell_width_f);
+            let link_y = origin.y + px(link.line as f32 * line_height_f) + line_height - px(1.5);
+            window.paint_quad(quad(
+                Bounds::new(
+                    Point::new(link_x, link_y),
+                    Size::new(px(link.len as f32 * cell_width_f), px(1.5)),
                 ),
                 px(0.0),
                 color,
