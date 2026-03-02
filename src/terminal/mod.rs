@@ -11,4 +11,4 @@ pub use colors::ColorPalette;
 pub use input::key_to_bytes;
 pub use terminal_element::TerminalElement;
 pub use content_extractor::ContentExtractor;
-pub use terminal_core::{Terminal, TerminalSize};
+pub use terminal_core::{SearchMatch, Terminal, TerminalSize};

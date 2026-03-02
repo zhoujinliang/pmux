@@ -40,6 +40,10 @@ pub struct TerminalView {
     scroll_offset: usize,
     is_focused: bool,
     cursor_visible: bool,
+    /// When Some, search is active; matches are computed and passed to TerminalElement
+    search_query: Option<String>,
+    /// Index of current match when cycling (Enter/Cmd+G)
+    search_current_match: Option<usize>,
 }
 
 impl TerminalView {
@@ -51,6 +55,8 @@ impl TerminalView {
             scroll_offset: 0,
             is_focused: false,
             cursor_visible: true,
+            search_query: None,
+            search_current_match: None,
         }
     }
 
@@ -63,6 +69,8 @@ impl TerminalView {
             scroll_offset: 0,
             is_focused: false,
             cursor_visible: true,
+            search_query: None,
+            search_current_match: None,
         }
     }
 
@@ -75,6 +83,13 @@ impl TerminalView {
     /// Set cursor visibility (for blink)
     pub fn with_cursor_visible(mut self, visible: bool) -> Self {
         self.cursor_visible = visible;
+        self
+    }
+
+    /// Set search state (query and current match index)
+    pub fn with_search(mut self, query: Option<String>, current: Option<usize>) -> Self {
+        self.search_query = query;
+        self.search_current_match = current;
         self
     }
 
@@ -131,11 +146,24 @@ impl RenderOnce for TerminalView {
             TerminalBuffer::Terminal { terminal, focus_handle, resize_callback } => {
                 use crate::terminal::terminal_element::TerminalElement;
                 use crate::terminal::ColorPalette;
+                let matches = self
+                    .search_query
+                    .as_ref()
+                    .map(|q| terminal.search(q))
+                    .unwrap_or_default();
+                let search_current = self.search_current_match.and_then(|i| {
+                    if i < matches.len() {
+                        Some(i)
+                    } else {
+                        matches.len().checked_sub(1)
+                    }
+                });
                 let mut elem = TerminalElement::new(
                     terminal.clone(),
                     focus_handle.clone(),
                     ColorPalette::default(),
-                );
+                )
+                .with_search(matches, search_current);
                 if let Some(cb) = resize_callback {
                     let cb = cb.clone();
                     elem = elem.with_resize_callback(move |cols, rows| cb(cols, rows));

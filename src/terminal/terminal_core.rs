@@ -148,6 +148,53 @@ impl Terminal {
     pub fn mode(&self) -> TermMode {
         *self.term.lock().mode()
     }
+
+    /// Search the visible terminal grid for `query`. Returns all matches.
+    /// Coordinates are in visual screen space (line 0 = top, col = column index).
+    pub fn search(&self, query: &str) -> Vec<SearchMatch> {
+        if query.is_empty() {
+            return vec![];
+        }
+        self.with_content(|term| {
+            use alacritty_terminal::grid::Dimensions;
+            use alacritty_terminal::index::{Column, Line, Point};
+            let grid = term.grid();
+            let screen_lines = grid.screen_lines();
+            let cols = grid.columns();
+            let display_offset = grid.display_offset() as i32;
+            let mut matches = Vec::new();
+
+            for row in 0..screen_lines {
+                let mut line_text = String::with_capacity(cols);
+                let line = Line(row as i32 - display_offset);
+                for col in 0..cols {
+                    let cell = &grid[Point { line, column: Column(col) }];
+                    line_text.push(cell.c);
+                }
+                let mut start = 0;
+                while let Some(pos) = line_text[start..].find(query) {
+                    matches.push(SearchMatch {
+                        line: row as i32,
+                        col: start + pos,
+                        len: query.len(),
+                    });
+                    start += pos + query.len();
+                    if start >= line_text.len() {
+                        break;
+                    }
+                }
+            }
+            matches
+        })
+    }
+}
+
+/// A text match in the terminal grid (visual coordinates)
+#[derive(Debug, Clone)]
+pub struct SearchMatch {
+    pub line: i32,
+    pub col: usize,
+    pub len: usize,
 }
 
 #[cfg(test)]
@@ -196,5 +243,18 @@ mod tests {
         let term = Terminal::new("test-5".into(), TerminalSize::default());
         assert!(term.title().is_none());
         // Title is set via OSC sequences — just test None initial state
+    }
+
+    #[test]
+    fn test_search_empty_query() {
+        let term = Terminal::new("t".into(), TerminalSize::default());
+        assert!(term.search("").is_empty());
+    }
+
+    #[test]
+    fn test_search_no_match() {
+        let term = Terminal::new("t".into(), TerminalSize::default());
+        let matches = term.search("zzz_no_match");
+        assert!(matches.is_empty());
     }
 }

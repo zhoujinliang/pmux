@@ -20,6 +20,8 @@ pub struct TerminalAreaEntity {
     on_divider_drag_start: Option<Arc<dyn Fn(Vec<bool>, f32, f32, bool, &mut Window, &mut App)>>,
     on_divider_drag_end: Option<Arc<dyn Fn(&mut Window, &mut App)>>,
     on_pane_click: Option<Arc<dyn Fn(usize, &mut Window, &mut App)>>,
+    search_query: Option<String>,
+    search_current_match: usize,
 }
 
 impl TerminalAreaEntity {
@@ -35,6 +37,8 @@ impl TerminalAreaEntity {
         on_divider_drag_start: Option<Arc<dyn Fn(Vec<bool>, f32, f32, bool, &mut Window, &mut App)>>,
         on_divider_drag_end: Option<Arc<dyn Fn(&mut Window, &mut App)>>,
         on_pane_click: Option<Arc<dyn Fn(usize, &mut Window, &mut App)>>,
+        search_query: Option<String>,
+        search_current_match: usize,
     ) -> Self {
         Self {
             split_tree,
@@ -47,6 +51,8 @@ impl TerminalAreaEntity {
             on_divider_drag_start,
             on_divider_drag_end,
             on_pane_click,
+            search_query,
+            search_current_match,
         }
     }
 
@@ -61,6 +67,11 @@ impl TerminalAreaEntity {
     pub fn set_split_divider_drag(&mut self, state: Option<(Vec<bool>, f32, f32, bool)>) {
         self.split_divider_drag = state;
     }
+
+    pub fn set_search(&mut self, query: Option<String>, current: usize) {
+        self.search_query = query;
+        self.search_current_match = current;
+    }
 }
 
 impl Render for TerminalAreaEntity {
@@ -71,6 +82,7 @@ impl Render for TerminalAreaEntity {
             self.focused_pane_index,
             &self.repo_name,
         )
+        .with_search(self.search_query.clone(), self.search_current_match)
         .with_cursor_blink_visible(self.cursor_blink_visible)
         .with_drag_state(self.split_divider_drag.clone());
 

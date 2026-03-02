@@ -28,6 +28,8 @@ pub struct SplitPaneContainer {
     on_divider_drag_end: Option<Arc<dyn Fn(&mut Window, &mut App)>>,
     /// Callback when user clicks a pane: (pane_index)
     on_pane_click: Option<Arc<dyn Fn(usize, &mut Window, &mut App)>>,
+    search_query: Option<String>,
+    search_current_match: usize,
 }
 
 impl SplitPaneContainer {
@@ -48,7 +50,15 @@ impl SplitPaneContainer {
             on_divider_drag_start: None,
             on_divider_drag_end: None,
             on_pane_click: None,
+            search_query: None,
+            search_current_match: 0,
         }
+    }
+
+    pub fn with_search(mut self, query: Option<String>, current: usize) -> Self {
+        self.search_query = query;
+        self.search_current_match = current;
+        self
     }
 
     pub fn with_cursor_blink_visible(mut self, visible: bool) -> Self {
@@ -114,6 +124,8 @@ impl RenderOnce for SplitPaneContainer {
         let terminal_buffers: &HashMap<String, TerminalBuffer> = &terminal_buffers_guard;
         let focused_pane_index = self.focused_pane_index;
         let repo_name = self.repo_name.clone();
+        let search_query = self.search_query.clone();
+        let search_current_match = self.search_current_match;
         let on_ratio_change = self.on_ratio_change.clone();
         let on_divider_drag_start = self.on_divider_drag_start.clone();
         let on_divider_drag_end = self.on_divider_drag_end.clone();
@@ -133,6 +145,8 @@ impl RenderOnce for SplitPaneContainer {
             &on_ratio_change,
             &on_divider_drag_start,
             &on_pane_click,
+            search_query,
+            search_current_match,
         );
 
         let is_dragging = drag_state.is_some();
@@ -188,6 +202,8 @@ impl SplitPaneContainer {
         on_ratio_change: &Option<Arc<dyn Fn(Vec<bool>, f32, &mut Window, &mut App)>>,
         on_divider_drag_start: &Option<Arc<dyn Fn(Vec<bool>, f32, f32, bool, &mut Window, &mut App)>>,
         on_pane_click: &Option<Arc<dyn Fn(usize, &mut Window, &mut App)>>,
+        search_query: Option<String>,
+        search_current_match: usize,
     ) -> impl IntoElement {
         match node {
             SplitNode::Pane { target } => {
@@ -212,11 +228,17 @@ impl SplitPaneContainer {
                             cb(pane_idx, window, cx);
                         }
                     });
+                let search_current = if search_query.is_some() {
+                    Some(search_current_match)
+                } else {
+                    None
+                };
                 let content = pane_div
                     .child(
                         TerminalView::with_buffer(target, &title, buffer.clone())
                             .with_focused(is_focused)
                             .with_cursor_visible(cursor_blink_visible)
+                            .with_search(search_query.clone(), search_current)
                             .into_element(),
                     )
                     .into_any_element();
@@ -245,6 +267,8 @@ impl SplitPaneContainer {
                     on_ratio_change,
                     on_divider_drag_start,
                     on_pane_click,
+                    search_query.clone(),
+                    search_current_match,
                 );
                 let right_el = self.render_node(
                     right,
@@ -257,6 +281,8 @@ impl SplitPaneContainer {
                     on_ratio_change,
                     on_divider_drag_start,
                     on_pane_click,
+                    search_query.clone(),
+                    search_current_match,
                 );
 
                 let divider = div()
@@ -320,6 +346,8 @@ impl SplitPaneContainer {
                     on_ratio_change,
                     on_divider_drag_start,
                     on_pane_click,
+                    search_query.clone(),
+                    search_current_match,
                 );
                 let bottom_el = self.render_node(
                     bottom,
@@ -332,6 +360,8 @@ impl SplitPaneContainer {
                     on_ratio_change,
                     on_divider_drag_start,
                     on_pane_click,
+                    search_query.clone(),
+                    search_current_match,
                 );
 
                 let divider = div()

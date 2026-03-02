@@ -1,7 +1,7 @@
 //! Custom GPUI Element for rendering a terminal grid.
 
 use crate::terminal::colors::ColorPalette;
-use crate::terminal::terminal_core::{Terminal, TerminalSize};
+use crate::terminal::terminal_core::{SearchMatch, Terminal, TerminalSize};
 use crate::terminal::terminal_rendering::{BatchedTextRun, LayoutRect, is_default_bg};
 use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::index::{Column, Line, Point as AlacPoint};
@@ -16,6 +16,8 @@ pub struct TerminalElement {
     palette: ColorPalette,
     on_resize: Option<Box<dyn Fn(u16, u16) + Send + Sync>>,
     style: StyleRefinement,
+    search_matches: Vec<SearchMatch>,
+    search_current: Option<usize>,
 }
 
 impl TerminalElement {
@@ -26,11 +28,19 @@ impl TerminalElement {
             palette,
             on_resize: None,
             style: StyleRefinement::default(),
+            search_matches: Vec::new(),
+            search_current: None,
         }
     }
 
     pub fn with_resize_callback(mut self, cb: impl Fn(u16, u16) + Send + Sync + 'static) -> Self {
         self.on_resize = Some(Box::new(cb));
+        self
+    }
+
+    pub fn with_search(mut self, matches: Vec<SearchMatch>, current: Option<usize>) -> Self {
+        self.search_matches = matches;
+        self.search_current = current;
         self
     }
 }
@@ -326,6 +336,32 @@ impl Element for TerminalElement {
 
         for run in text_runs {
             run.paint(origin, cell_width, line_height, font_size, window, cx);
+        }
+
+        let cell_width_f: f32 = cell_width.into();
+        let line_height_f: f32 = line_height.into();
+
+        // Paint search match overlays
+        for (idx, m) in self.search_matches.iter().enumerate() {
+            let is_current = self.search_current == Some(idx);
+            let color = if is_current {
+                Hsla { h: 0.1, s: 0.9, l: 0.6, a: 0.7 }
+            } else {
+                Hsla { h: 0.15, s: 1.0, l: 0.7, a: 0.4 }
+            };
+            let match_x = origin.x + px(m.col as f32 * cell_width_f);
+            let match_y = origin.y + px(m.line as f32 * line_height_f);
+            window.paint_quad(quad(
+                Bounds::new(
+                    Point::new(match_x, match_y),
+                    Size::new(px(m.len as f32 * cell_width_f), line_height),
+                ),
+                px(0.0),
+                color,
+                Edges::default(),
+                transparent_black(),
+                Default::default(),
+            ));
         }
 
         if self.terminal.mode().contains(TermMode::SHOW_CURSOR) {

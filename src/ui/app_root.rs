@@ -135,6 +135,12 @@ pub struct AppRoot {
     notification_panel_entity: Option<Entity<NotificationPanelEntity>>,
     /// Terminal area Entity - when content changes, notify this instead of AppRoot (Phase 4)
     terminal_area_entity: Option<Entity<TerminalAreaEntity>>,
+    /// When true, search bar is visible and keyboard input appends to search_query
+    search_active: bool,
+    /// Current search query (when search_active)
+    search_query: String,
+    /// Index of current match when cycling (Enter/Cmd+G)
+    search_current_match: usize,
 }
 
 impl AppRoot {
@@ -254,6 +260,9 @@ impl AppRoot {
             notification_panel_model: None,
             notification_panel_entity: None,
             terminal_area_entity: None,
+            search_active: false,
+            search_query: String::new(),
+            search_current_match: 0,
         }
     }
 
@@ -966,6 +975,12 @@ impl AppRoot {
                 Some(on_drag_start),
                 Some(on_drag_end),
                 Some(on_pane),
+                if self.search_active {
+                    Some(self.search_query.clone())
+                } else {
+                    None
+                },
+                self.search_current_match,
             )
         });
         if let Ok(mut guard) = term_entity_holder.lock() {
@@ -1969,10 +1984,99 @@ impl AppRoot {
             }
         }
 
+        // When search is active, handle search-specific keys
+        if self.search_active {
+            match event.keystroke.key.as_str() {
+                "escape" => {
+                    self.search_active = false;
+                    self.search_query.clear();
+                    if let Some(ref e) = self.terminal_area_entity {
+                        let _ = cx.update_entity(e, |ent: &mut TerminalAreaEntity, cx| {
+                            ent.set_search(None, 0);
+                            cx.notify();
+                        });
+                    }
+                    cx.notify();
+                    return;
+                }
+                "enter" | "g" if event.keystroke.modifiers.platform => {
+                    // Cmd+G or Enter: next match (need terminal to count matches)
+                    if let Ok(buffers) = self.terminal_buffers.lock() {
+                        if let Some(target) = self.active_pane_target.as_ref() {
+                            if let Some(TerminalBuffer::Terminal { terminal, .. }) = buffers.get(target) {
+                                let matches = terminal.search(&self.search_query);
+                                if !matches.is_empty() {
+                                    self.search_current_match =
+                                        (self.search_current_match + 1) % matches.len();
+                                    if let Some(ref e) = self.terminal_area_entity {
+                                        let _ = cx.update_entity(e, |ent: &mut TerminalAreaEntity, cx| {
+                                            ent.set_search(
+                                                Some(self.search_query.clone()),
+                                                self.search_current_match,
+                                            );
+                                            cx.notify();
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    cx.notify();
+                    return;
+                }
+                "backspace" => {
+                    self.search_query.pop();
+                    if let Some(ref e) = self.terminal_area_entity {
+                        let query = self.search_query.clone();
+                        let _ = cx.update_entity(e, |ent: &mut TerminalAreaEntity, cx| {
+                            ent.set_search(
+                                if query.is_empty() { None } else { Some(query) },
+                                self.search_current_match,
+                            );
+                            cx.notify();
+                        });
+                    }
+                    cx.notify();
+                    return;
+                }
+                _ => {
+                    // Printable: append to search_query (simplified - only ascii)
+                    if event.keystroke.key.len() == 1 {
+                        let ch = event.keystroke.key.chars().next().unwrap();
+                        if ch.is_ascii_graphic() || ch == ' ' {
+                            self.search_query.push(ch);
+                            if let Some(ref e) = self.terminal_area_entity {
+                                let query = self.search_query.clone();
+                                let _ = cx.update_entity(e, |ent: &mut TerminalAreaEntity, cx| {
+                                    ent.set_search(Some(query), self.search_current_match);
+                                    cx.notify();
+                                });
+                            }
+                            cx.notify();
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+
         // Check for Cmd+key shortcuts (app shortcuts)
         if event.keystroke.modifiers.platform {
             match event.keystroke.key.as_str() {
                 "b" => self.sidebar_visible = !self.sidebar_visible,
+                "f" => {
+                    self.search_active = true;
+                    self.search_query.clear();
+                    self.search_current_match = 0;
+                    if let Some(ref e) = self.terminal_area_entity {
+                        let _ = cx.update_entity(e, |ent: &mut TerminalAreaEntity, cx| {
+                            ent.set_search(Some(String::new()), 0);
+                            cx.notify();
+                        });
+                    }
+                    cx.notify();
+                    return;
+                }
                 "i" => {
                     if let Some(ref model) = self.notification_panel_model {
                         let _ = cx.update_entity(model, |m, cx| {
@@ -2897,6 +3001,7 @@ impl AppRoot {
                                     .min_h_0()
                                     .overflow_hidden()
                                     .cursor(gpui::CursorStyle::IBeam)
+                                    .relative()
                                     .child(
                                         if worktree_switch_loading.is_some() {
                                             div()
@@ -2920,6 +3025,14 @@ impl AppRoot {
                                             )
                                             .with_cursor_blink_visible(cursor_blink_visible)
                                             .with_drag_state(split_divider_drag)
+                                            .with_search(
+                                                if self.search_active {
+                                                    Some(self.search_query.clone())
+                                                } else {
+                                                    None
+                                                },
+                                                self.search_current_match,
+                                            )
                                             .on_ratio_change(move |path, ratio, _window, cx| {
                                                 let _ = cx.update_entity(&app_root_entity_for_ratio, |this: &mut AppRoot, cx| {
                                                     this.split_tree.update_ratio(&path, ratio);
@@ -2969,6 +3082,21 @@ impl AppRoot {
                                             .into_any_element()
                                         }
                                     )
+                                    .when(self.search_active, |el| {
+                                        el.child(
+                                            div()
+                                                .absolute()
+                                                .top(px(2.0))
+                                                .right(px(12.0))
+                                                .bg(rgb(0x2e343e))
+                                                .border_1()
+                                                .border_color(rgb(0x5c6370))
+                                                .rounded(px(4.0))
+                                                .px(px(8.0))
+                                                .py(px(4.0))
+                                                .child(format!("🔍 {}_", self.search_query))
+                                        )
+                                    })
                             })
                     )
             )
