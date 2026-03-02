@@ -4,6 +4,7 @@ pub mod colors;
 pub mod content_extractor;
 pub mod stream_adapter;
 pub mod terminal_core;
+pub mod terminal_rendering;
 
 pub use colors::ColorPalette;
 pub use content_extractor::ContentExtractor;
