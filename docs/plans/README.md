@@ -65,6 +65,12 @@
 
 **参考:** [2026-03-gpui-terminal-refactor-default-tmux.md](2026-03-gpui-terminal-refactor-default-tmux.md)（brainstorming 方案）
 
+## Terminal 性能优化
+
+| 计划 | 目标 | 预估 |
+|------|------|------|
+| [2026-03-02-tmux-input-perf-direct-pty-write.md](2026-03-02-tmux-input-perf-direct-pty-write.md) | Direct PTY write 绕过 send-keys；BatchedTextRun 替代逐字符 shape_line；清理 debug 日志；缓存 cell metrics | ~2 小时 |
+
 ## 历史计划
 
 - [2026-02-25-spec2-implementation.md](2026-02-25-spec2-implementation.md) — Sidebar + Terminal 实现

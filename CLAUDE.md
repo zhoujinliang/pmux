@@ -60,8 +60,8 @@ cargo check
 - `config.rs` - Configuration persistence (~/.config/pmux/config.json)
 
 **Runtime Backends (`src/runtime/backends/`)**
-- `mod.rs` - Backend factory: resolve_backend(), create_runtime_from_env(), recover_runtime(); default = "local"
-- `local_pty.rs` - LocalPtyAgent (default backend): direct PTY spawn, multi-pane, diff/review
+- `mod.rs` - Backend factory: resolve_backend(), create_runtime_from_env(), recover_runtime(); default = "tmux" (control mode)
+- `local_pty.rs` - LocalPtyAgent (fallback when tmux unavailable): direct PTY spawn, multi-pane, diff/review
 - `tmux_control_mode.rs` - tmux -CC control mode: ControlModeParser (%output/%begin/%end/%exit), TmuxControlModeRuntime (persistence backend)
 - `tmux.rs` - Legacy TmuxRuntime (pipe-pane + capture-pane), deprecated
 

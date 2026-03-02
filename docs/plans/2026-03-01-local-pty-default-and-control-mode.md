@@ -1758,8 +1758,12 @@ Week 4:  Task 12   (Phase 2 E2E: 持久化+恢复+截图断言)    ← 自动化
 
 ## 后续（不在本 Plan 内）
 
-- 旧 `TmuxRuntime`（pipe-pane）标记 deprecated，保留供兼容
-- `PMUX_BACKEND=tmux` 逐步指向 `tmux-cc`（配置迁移）
+- ~~旧 `TmuxRuntime`（pipe-pane）标记 deprecated，保留供兼容~~ ✅ Done
+- ~~`PMUX_BACKEND=tmux` 逐步指向 `tmux-cc`（配置迁移）~~ ✅ Done — "tmux" now uses TmuxControlModeRuntime
 - 多 pane control mode 支持（`%output` 已按 pane_id 路由）
 - scrollback 拉取（`capture-pane -S -N` 通过 control mode 一次性查询）
 - libghostty-vt 替换 alacritty_terminal（Phase 3+，等 C API 稳定）
+
+## Status: ALL TASKS COMPLETE ✅
+
+Phase 1 (Tasks 1-6) and Phase 2 (Tasks 7-12) fully implemented. Default backend is now "tmux" (control mode). Legacy TmuxRuntime deprecated. "tmux" and "tmux-cc" consolidated to TmuxControlModeRuntime.

@@ -13,69 +13,69 @@
 
 ### A2. 实现 split_pane (local_pty)
 
-- A2.1 设计 `LocalPtyAgent` 多 pane 管理结构
-- A2.2 修改 `LocalPtyRuntime` 支持创建多个实例
-- A2.3 实现 `split_pane` 方法，创建新 PTY
-- A2.4 为新 pane 生成唯一 ID 格式
-- A2.5 在 AppRoot 中为 split 创建 TerminalBuffer
-- A2.6 集成 StatusPublisher 注册新 pane
-- A2.7 修复 ⌘D (垂直分屏) 快捷键
-- A2.8 修复 ⌘⇧D (水平分屏) 快捷键
-- A2.9 修复 ⌘⌥方向键 pane 焦点切换
-- A2.10 测试分屏后各 pane 独立工作
-- A2.11 测试分屏后状态检测正常
+- [x] A2.1 设计 `LocalPtyAgent` 多 pane 管理结构
+- [x] A2.2 修改 `LocalPtyRuntime` 支持创建多个实例
+- [x] A2.3 实现 `split_pane` 方法，创建新 PTY
+- [x] A2.4 为新 pane 生成唯一 ID 格式
+- [x] A2.5 在 AppRoot 中为 split 创建 TerminalBuffer
+- [x] A2.6 集成 StatusPublisher 注册新 pane
+- [x] A2.7 修复 ⌘D (垂直分屏) 快捷键
+- [x] A2.8 修复 ⌘⇧D (水平分屏) 快捷键
+- [x] A2.9 修复 ⌘⌥方向键 pane 焦点切换
+- [x] A2.10 测试分屏后各 pane 独立工作
+- [x] A2.11 测试分屏后状态检测正常
 
 ## Phase B: P1 完整功能
 
 ### B1. 实现 open_diff / open_review
 
-- B1.1 设计 diff 显示方案（terminal 输出 vs 内置 UI）
-- B1.2 实现 `open_diff` 基础逻辑
-- B1.3 检测 main 分支，避免空 diff
-- B1.4 执行 `git diff main...HEAD --color=always`
-- B1.5 在新 pane 或当前 pane 显示 diff
-- B1.6 实现 `open_review`（复用或扩展 open_diff）
-- B1.7 修复 ⌘⇧D 快捷键打开 diff
-- B1.8 修复 ⌘⇧R 快捷键打开 review
-- B1.9 测试 diff 内容正确显示
-- B1.10 测试关闭 diff pane 后回到原工作区
+- [x] B1.1 设计 diff 显示方案（terminal 输出 vs 内置 UI）
+- [x] B1.2 实现 `open_diff` 基础逻辑
+- [x] B1.3 检测 main 分支，避免空 diff
+- [x] B1.4 执行 `git diff main...HEAD --color=always`
+- [x] B1.5 在新 pane 或当前 pane 显示 diff
+- [x] B1.6 实现 `open_review`（复用或扩展 open_diff）
+- [x] B1.7 修复 ⌘⇧D 快捷键打开 diff
+- [x] B1.8 修复 ⌘⇧R 快捷键打开 review
+- [x] B1.9 测试 diff 内容正确显示
+- [x] B1.10 测试关闭 diff pane 后回到原工作区
 
 ### B2. 实现 TmuxRuntime Backend
 
-- B2.1 创建 `src/runtime/backends/tmux.rs`
-- B2.2 实现 `TmuxRuntime` 结构体
-- B2.3 实现 `AgentRuntime` trait for `TmuxRuntime`
-- B2.4 实现 `send_input` via `tmux send-keys`
-- B2.5 实现 `subscribe_output` via `tmux pipe-pane -o`
-- B2.6 实现 `split_pane` via `tmux split-window`
-- B2.7 实现 `open_diff` via `tmux new-window` + nvim
-- B2.8 实现 `kill_window` via `tmux kill-window`
-- B2.9 修改 backends/mod.rs 支持 tmux backend
-- B2.10 添加 backend 选择逻辑
+- [x] B2.1 创建 `src/runtime/backends/tmux.rs` (legacy) + `tmux_control_mode.rs` (current)
+- [x] B2.2 实现 `TmuxControlModeRuntime` 结构体（consolidated from tmux + tmux-cc）
+- [x] B2.3 实现 `AgentRuntime` trait for `TmuxControlModeRuntime`
+- [x] B2.4 实现 `send_input` via control mode `send-keys -l`
+- [x] B2.5 实现 `subscribe_output` via `%output` events (control mode)
+- [x] B2.6 实现 `split_pane` via `split-window` command
+- [x] B2.7 实现 `open_diff` via split + nvim diffview
+- [x] B2.8 实现 `kill_window` via `kill-window` command
+- [x] B2.9 修改 backends/mod.rs 支持 tmux backend（"tmux" = tmux-cc）
+- [x] B2.10 添加 backend 选择逻辑（resolve_backend: env > config > default "tmux"）
 
 ### B3. Backend 选择与配置
 
-- B3.1 在 Config 中添加 `backend` 字段
-- B3.2 实现 backend 选择逻辑（config > 环境变量 > 默认）
-- B3.3 修改 `create_runtime` 根据配置创建对应 backend
-- B3.4 更新依赖检测：tmux backend 检查 tmux，local_pty 不检查
-- B3.5 添加 `PMUX_BACKEND` 环境变量支持
-- B3.6 测试 backend 切换正常工作
-- B3.7 测试 tmux backend session 持久化
-- B3.8 测试 local_pty 无需 tmux 依赖
+- [x] B3.1 在 Config 中添加 `backend` 字段
+- [x] B3.2 实现 backend 选择逻辑（env PMUX_BACKEND > config.backend > default "tmux"）
+- [x] B3.3 修改 `create_runtime_from_env` 根据配置创建对应 backend
+- [x] B3.4 更新依赖检测：tmux backend 检查 tmux_available()，不可用时 fallback 到 local
+- [x] B3.5 添加 `PMUX_BACKEND` 环境变量支持
+- [x] B3.6 测试 backend 切换正常工作
+- [x] B3.7 测试 tmux backend session 持久化（tmux_cc_e2e.sh）
+- [x] B3.8 测试 local_pty 无需 tmux 依赖（smoke_ls_pwd.sh with PMUX_BACKEND=local）
 
 ## Phase C: P2 优化完善
 
 ### C1. 实现 recover() Session 恢复
 
-- C1.1 分析 RuntimeState 现有数据结构
-- C1.2 完善 `try_recover_then_switch` 实现
-- C1.3 完善 `try_recover_then_start` 实现
-- C1.4 实现 tmux session attach 逻辑
-- C1.5 实现 pane 状态恢复
-- C1.6 测试重启后 session 恢复
+- [x] C1.1 分析 RuntimeState 现有数据结构
+- [x] C1.2 完善 `try_recover_then_switch` 实现
+- [x] C1.3 完善 `try_recover_then_start` 实现
+- [x] C1.4 实现 tmux session attach 逻辑（via TmuxControlModeRuntime::new with existing session）
+- [x] C1.5 实现 pane 状态恢复
+- [x] C1.6 测试重启后 session 恢复（tmux_cc_e2e.sh Test 5）
 - C1.7 测试多 worktree 场景恢复
-- C1.8 处理恢复失败时的 fallback 逻辑
+- [x] C1.8 处理恢复失败时的 fallback 逻辑
 
 ### C2. 移除状态轮询
 

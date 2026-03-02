@@ -1,4 +1,4 @@
-//! Debug session instrumentation - appends NDJSON to .cursor/debug-87bd77.log
+//! Debug session instrumentation - appends NDJSON to .cursor/debug-*.log
 #![allow(dead_code)]
 use std::fs::OpenOptions;
 use std::io::Write;
@@ -8,7 +8,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 const LOG_PATH: &str = "/Users/matt.chow/workspace/pmux/.cursor/debug-87bd77.log";
 
 /// Session debug log for current debug run
-const SESSION_LOG_PATH: &str = "/Users/matt.chow/workspace/pmux/.cursor/debug-df34ba.log";
+const SESSION_LOG_PATH: &str = "/Users/matt.chow/workspace/pmux/.cursor/debug-6882f7.log";
 
 static RENDER_COUNT: AtomicU64 = AtomicU64::new(0);
 static RENDER_MAX_DURATION_MS: AtomicU64 = AtomicU64::new(0);
@@ -58,7 +58,7 @@ pub fn dbg_session_log(location: &str, message: &str, data: &serde_json::Value, 
         .map(|d| d.as_millis())
         .unwrap_or(0);
     let entry = serde_json::json!({
-        "sessionId": "df34ba",
+        "sessionId": "6882f7",
         "location": location,
         "message": message,
         "data": data,

@@ -344,9 +344,9 @@ git commit -m "feat(terminal): add ContentExtractor for status pipeline"
 
 ---
 
-## Phase 2: 默认 Backend 改为 tmux
+## Phase 2: 默认 Backend 改为 tmux ✅
 
-### Task 6: DEFAULT_BACKEND 改为 tmux
+### Task 6: DEFAULT_BACKEND 改为 tmux ✅
 
 **Files:**
 - Modify: src/runtime/backends/mod.rs:24
@@ -468,9 +468,9 @@ git commit -m "refactor(terminal): remove legacy engine, use gpui-terminal; upda
 
 ---
 
-## Phase 6: 可选 — tmux 不可用时 Fallback
+## Phase 6: 可选 — tmux 不可用时 Fallback ✅
 
-### Task 10: tmux 不可用时 fallback 到 local
+### Task 10: tmux 不可用时 fallback 到 local ✅
 
 **Files:**
 - Modify: src/runtime/backends/mod.rs (create_runtime_from_env)

@@ -7,7 +7,7 @@ fn default_terminal_row_cache_size() -> usize {
 }
 
 fn default_backend() -> String {
-    "local".to_string()
+    "tmux".to_string()
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -83,6 +83,8 @@ impl Default for Config {
             per_repo_worktree_index: HashMap::new(),
             backend: default_backend(),
             remote_channels: RemoteChannelsConfig::default(),
+            last_terminal_cols: None,
+            last_terminal_rows: None,
         }
     }
 }
@@ -122,6 +124,11 @@ pub struct Config {
     /// Remote notification channels (Discord, KOOK)
     #[serde(default)]
     pub remote_channels: RemoteChannelsConfig,
+    /// Last known terminal dimensions (cols, rows) for faster TUI startup
+    #[serde(default)]
+    pub last_terminal_cols: Option<u16>,
+    #[serde(default)]
+    pub last_terminal_rows: Option<u16>,
 }
 
 impl Config {
@@ -147,11 +154,10 @@ impl Config {
 
         let content = std::fs::read_to_string(path)?;
         let mut config: Config = serde_json::from_str(&content)?;
-        // Validate backend; log warning and fallback if invalid
-        const VALID_BACKENDS: [&str; 2] = ["local", "tmux"];
+        const VALID_BACKENDS: [&str; 3] = ["local", "tmux", "tmux-cc"];
         if !VALID_BACKENDS.contains(&config.backend.as_str()) {
             eprintln!(
-                "pmux: invalid backend '{}' in config, using '{}'. Valid: local, tmux",
+                "pmux: invalid backend '{}' in config, using '{}'. Valid: local, tmux, tmux-cc",
                 config.backend,
                 default_backend()
             );
@@ -408,14 +414,14 @@ mod tests {
         assert_eq!(loaded_per_repo.get(&PathBuf::from("/path/repo2")), Some(&0));
     }
 
-    /// Test: Config invalid backend falls back to default (local)
+    /// Test: Config invalid backend falls back to default (tmux)
     #[test]
     fn test_config_load_invalid_backend_fallback() {
         let temp_dir = TempDir::new().unwrap();
         let path = temp_dir.path().join("config.json");
         std::fs::write(&path, r#"{"backend": "docker"}"#).unwrap();
         let config = Config::load_from_path(&path).unwrap();
-        assert_eq!(config.backend, default_backend());
+        assert_eq!(config.backend, "tmux");
     }
 
     /// Test: Config backend field is loaded from JSON
@@ -426,6 +432,16 @@ mod tests {
         std::fs::write(&path, r#"{"backend": "tmux"}"#).unwrap();
         let config = Config::load_from_path(&path).unwrap();
         assert_eq!(config.backend, "tmux");
+    }
+
+    /// Test: Config accepts tmux-cc as valid backend (alias for tmux control mode)
+    #[test]
+    fn test_config_backend_tmux_cc_accepted() {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("config.json");
+        std::fs::write(&path, r#"{"backend": "tmux-cc"}"#).unwrap();
+        let config = Config::load_from_path(&path).unwrap();
+        assert_eq!(config.backend, "tmux-cc");
     }
 
     /// Test: remote_channels loads discord.enabled, kook.channel_id, feishu.chat_id from JSON

@@ -22,10 +22,12 @@ use crate::runtime::WorktreeState;
 pub const PMUX_BACKEND_ENV: &str = "PMUX_BACKEND";
 
 /// Default backend when environment variable is not set.
-pub const DEFAULT_BACKEND: &str = "local";
+/// tmux (control mode) provides session persistence — agents keep running after GUI closes.
+/// Falls back to local PTY automatically when tmux is not installed.
+pub const DEFAULT_BACKEND: &str = "tmux";
 
-/// Resolve backend: PMUX_BACKEND env > config.backend > "local".
-/// Invalid values (non-local/tmux) fall back to DEFAULT_BACKEND.
+/// Resolve backend: PMUX_BACKEND env > config.backend > DEFAULT_BACKEND ("tmux").
+/// Invalid values fall back to DEFAULT_BACKEND.
 pub fn resolve_backend(config: Option<&Config>) -> String {
     const VALID: [&str; 3] = ["local", "tmux", "tmux-cc"];
     let from_env = std::env::var(PMUX_BACKEND_ENV).ok();
@@ -91,7 +93,7 @@ pub struct RuntimeCreationResult {
 }
 
 /// Create a runtime for the given worktree.
-/// Backend resolution: PMUX_BACKEND env > config.backend > "local".
+/// Backend resolution: PMUX_BACKEND env > config.backend > "tmux".
 ///
 /// Tmux: one workspace = one session, one worktree = one window.
 ///
@@ -109,59 +111,79 @@ pub fn create_runtime_from_env(
 ) -> Result<RuntimeCreationResult, RuntimeError> {
     let backend = resolve_backend(config);
 
+    // #region agent log
+    crate::debug_log::dbg_session_log(
+        "mod.rs:create_runtime_from_env",
+        "backend resolved",
+        &serde_json::json!({
+            "backend": &backend,
+            "tmux_available": tmux_available(),
+            "workspace_path": workspace_path.to_string_lossy(),
+            "worktree_path": worktree_path.to_string_lossy(),
+            "branch_name": branch_name,
+            "config_backend": config.map(|c| c.backend.as_str()).unwrap_or("none"),
+        }),
+        "H_backend",
+    );
+    // #endregion
+
     match backend.as_str() {
-        "tmux" => {
+        "tmux" | "tmux-cc" => {
             #[cfg(unix)]
             {
                 if !tmux_available() {
                     let rt = create_runtime(worktree_path, cols, rows)?;
                     return Ok(RuntimeCreationResult {
                         runtime: rt,
-                        fallback_message: Some("tmux 不可用，已回退到 local".to_string()),
+                        fallback_message: Some(
+                            "tmux not installed — using local PTY (no session persistence). \
+                             Install tmux for persistent agent sessions."
+                                .to_string(),
+                        ),
                     });
                 }
                 let session_name = session_name_for_workspace(workspace_path);
                 let window_name = window_name_for_worktree(worktree_path, branch_name);
+                // #region agent log
+                crate::debug_log::dbg_session_log(
+                    "mod.rs:create_runtime_from_env",
+                    "creating TmuxControlModeRuntime",
+                    &serde_json::json!({"session_name": &session_name, "window_name": &window_name}),
+                    "H_backend",
+                );
+                // #endregion
+                let tmux_result = tmux_control_mode::TmuxControlModeRuntime::new(
+                    &session_name,
+                    &window_name,
+                    Some(worktree_path),
+                    cols,
+                    rows,
+                );
+                // #region agent log
+                crate::debug_log::dbg_session_log(
+                    "mod.rs:create_runtime_from_env",
+                    "TmuxControlModeRuntime::new result",
+                    &serde_json::json!({"ok": tmux_result.is_ok(), "err": tmux_result.as_ref().err().map(|e| e.to_string())}),
+                    "H_backend",
+                );
+                // #endregion
+                let runtime = Arc::new(
+                    tmux_result.map_err(|e| RuntimeError::Backend(format!("tmux: {}", e)))?,
+                );
                 Ok(RuntimeCreationResult {
-                    runtime: create_tmux_runtime(session_name, window_name, worktree_path),
+                    runtime,
                     fallback_message: None,
                 })
             }
             #[cfg(not(unix))]
-            Err(RuntimeError::Backend(
-                "tmux backend not supported on non-Unix platforms".into(),
-            ))
-        }
-        "tmux-cc" => {
-            #[cfg(unix)]
             {
-                if !tmux_available() {
-                    let rt = create_runtime(worktree_path, cols, rows)?;
-                    return Ok(RuntimeCreationResult {
-                        runtime: rt,
-                        fallback_message: Some("tmux 不可用，已回退到 local".to_string()),
-                    });
-                }
-                let session_name = session_name_for_workspace(workspace_path);
-                let window_name = window_name_for_worktree(worktree_path, branch_name);
-                let runtime = Arc::new(
-                    tmux_control_mode::TmuxControlModeRuntime::new(
-                        &session_name,
-                        &window_name,
-                        Some(worktree_path),
-                    )
-                    .map_err(|e| RuntimeError::Backend(format!("tmux-cc: {}", e)))?,
-                );
-                return Ok(RuntimeCreationResult {
-                    runtime,
-                    fallback_message: None,
-                });
-            }
-            #[cfg(not(unix))]
-            {
-                return Err(RuntimeError::Backend(
-                    "tmux-cc not supported on this platform".into(),
-                ));
+                let rt = create_runtime(worktree_path, cols, rows)?;
+                Ok(RuntimeCreationResult {
+                    runtime: rt,
+                    fallback_message: Some(
+                        "tmux not supported on this platform — using local PTY.".to_string(),
+                    ),
+                })
             }
         }
         "local" | _ => {
@@ -215,26 +237,22 @@ pub fn recover_runtime(
     backend: &str,
     state: &WorktreeState,
     _event_bus: Option<Arc<crate::runtime::EventBus>>,
+    cols: u16,
+    rows: u16,
 ) -> Result<Arc<dyn AgentRuntime>, RuntimeError> {
     match backend {
         "local" | "local_pty" => Err(RuntimeError::Backend(
             "local_pty does not support session recovery".into(),
         )),
-        "tmux" => {
-            // Attach to existing tmux session/window
-            let runtime = TmuxRuntime::attach(
-                &state.backend_session_id,
-                &state.backend_window_id,
-            )?;
-            Ok(Arc::new(runtime))
-        }
-        "tmux-cc" => {
+        "tmux" | "tmux-cc" => {
             let runtime = tmux_control_mode::TmuxControlModeRuntime::new(
                 &state.backend_session_id,
                 &state.backend_window_id,
                 None,
+                cols,
+                rows,
             )
-            .map_err(|e| RuntimeError::Backend(format!("tmux-cc recover: {}", e)))?;
+            .map_err(|e| RuntimeError::Backend(format!("tmux recover: {}", e)))?;
             Ok(Arc::new(runtime))
         }
         _ => Err(RuntimeError::Backend(format!(
@@ -250,16 +268,15 @@ pub fn recover_runtime(
     backend: &str,
     _state: &WorktreeState,
     _event_bus: Option<Arc<crate::runtime::EventBus>>,
+    _cols: u16,
+    _rows: u16,
 ) -> Result<Arc<dyn AgentRuntime>, RuntimeError> {
     match backend {
         "local" | "local_pty" => Err(RuntimeError::Backend(
             "local_pty does not support session recovery".into(),
         )),
-        "tmux" => Err(RuntimeError::Backend(
-            "tmux backend not supported on non-Unix platforms".into(),
-        )),
-        "tmux-cc" => Err(RuntimeError::Backend(
-            "tmux-cc not supported on non-Unix platforms".into(),
+        "tmux" | "tmux-cc" => Err(RuntimeError::Backend(
+            "tmux not supported on non-Unix platforms".into(),
         )),
         _ => Err(RuntimeError::Backend(format!(
             "unknown backend: {}",
@@ -276,15 +293,15 @@ mod tests {
     use std::path::PathBuf;
 
     #[test]
-    fn test_default_backend_is_local() {
-        assert_eq!(DEFAULT_BACKEND, "local");
+    fn test_default_backend_is_tmux() {
+        assert_eq!(DEFAULT_BACKEND, "tmux");
     }
 
     #[test]
-    fn test_resolve_backend_defaults_to_local() {
+    fn test_resolve_backend_defaults_to_tmux() {
         std::env::remove_var("PMUX_BACKEND");
         let backend = resolve_backend(None);
-        assert_eq!(backend, "local");
+        assert_eq!(backend, "tmux");
     }
 
     #[test]
@@ -357,7 +374,7 @@ mod tests {
             backend_window_id: String::new(),
             split_tree_json: None,
         };
-        let result = recover_runtime("unknown_backend", &state, None);
+        let result = recover_runtime("unknown_backend", &state, None, 80, 24);
         assert!(result.is_err());
     }
 
@@ -373,7 +390,7 @@ mod tests {
             backend_window_id: String::new(),
             split_tree_json: None,
         };
-        let result = recover_runtime("local", &state, None);
+        let result = recover_runtime("local", &state, None, 80, 24);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("does not support"));
     }

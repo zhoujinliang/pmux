@@ -12,7 +12,7 @@ use crate::system_notifier;
 use crate::shell_integration::ShellPhaseInfo;
 use crate::terminal::{ContentExtractor, RuntimeReader, RuntimeWriter, tee_output};
 use crate::runtime::{AgentRuntime, EventBus, RuntimeEvent, StatusPublisher};
-use crate::runtime::backends::{create_runtime_from_env, recover_runtime, resolve_backend, window_name_for_worktree, window_target};
+use crate::runtime::backends::{create_runtime_from_env, recover_runtime, resolve_backend, session_name_for_workspace, window_name_for_worktree, window_target};
 use crate::runtime::{RuntimeState, WorktreeState};
 use crate::ui::{AppState, sidebar::Sidebar, workspace_tabbar::WorkspaceTabBar, terminal_controller::ResizeController, terminal_view::TerminalBuffer, terminal_area_entity::TerminalAreaEntity, notification_panel_entity::NotificationPanelEntity, new_branch_dialog_entity::NewBranchDialogEntity, delete_worktree_dialog_ui::DeleteWorktreeDialogUi, split_pane_container::SplitPaneContainer, diff_overlay::DiffOverlay, status_bar::StatusBar, models::{StatusCountsModel, NotificationPanelModel, NewBranchDialogModel}, topbar_entity::TopBarEntity};
 use crate::split_tree::SplitNode;
@@ -28,7 +28,6 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 /// When true, AppRoot will set show_settings=true and clear this flag at start of render.
 /// Used by menu action (open_settings) to open Settings from main.rs without window access.
@@ -117,6 +116,8 @@ pub struct AppRoot {
     resize_controller: ResizeController,
     /// Last (cols, rows) we resized to. Used to initialize new engines at full size (avoids flash).
     preferred_terminal_dims: Option<(u16, u16)>,
+    /// Shared dims updated by resize callback (callable from paint phase without cx).
+    shared_terminal_dims: Arc<std::sync::Mutex<Option<(u16, u16)>>>,
     /// When true, show the Settings modal overlay
     show_settings: bool,
     /// Draft config when Settings is open; None when closed. Updated on open and by toggles.
@@ -244,6 +245,7 @@ impl AppRoot {
             terminal_focus: None,
             resize_controller: ResizeController::new(),
             preferred_terminal_dims: None,
+            shared_terminal_dims: Arc::new(std::sync::Mutex::new(None)),
             show_settings: false,
             settings_draft: None,
             settings_secrets_draft: None,
@@ -468,21 +470,16 @@ impl AppRoot {
     /// Ensures all tmux sessions exist, attaches to active tab, restores per-repo worktree selection
     pub fn init_workspace_restoration(&mut self, cx: &mut Context<Self>) {
         self.ensure_entities(cx);
-        // Stable focus handle must persist across renders; creating it here ensures key events reach handle_key_down
         if self.terminal_focus.is_none() {
             self.terminal_focus = Some(cx.focus_handle());
         }
-        // Sessions are created on demand when switching worktrees or starting tmux (workspace=session)
 
-        // Attach to active tab (full polling, input)
-        let repo_name = self.workspace_manager.active_tab().map(|t| t.name.clone());
         let repo_path = self.workspace_manager.active_tab().map(|t| t.path.clone());
 
-        if let (Some(name), Some(path)) = (repo_name, repo_path) {
+        if let Some(path) = repo_path {
             self.refresh_worktrees_for_repo(&path);
             let worktrees = &self.cached_worktrees;
 
-            // Restore per-repo worktree selection if saved
             let restored_idx = self.per_repo_worktree_index.get(&path).copied();
             if let Some(awi) = restored_idx {
                 if awi < worktrees.len() {
@@ -490,34 +487,23 @@ impl AppRoot {
                     if let Some(wt) = worktrees.get(awi) {
                         let wt_path = wt.path.clone();
                         let branch = wt.short_branch_name().to_string();
-                        if self.try_recover_then_switch(&path, &wt_path, &branch, cx) {
-                            return;
-                        }
-                        self.switch_to_worktree(&wt_path, &branch, cx);
+                        self.schedule_switch_to_worktree_async(&path, &wt_path, &branch, awi, cx);
                         return;
                     }
                 }
             }
 
-            // No saved worktree or invalid: use first worktree if any, else repo session
             self.active_worktree_index = None;
             if !worktrees.is_empty() {
                 self.active_worktree_index = Some(0);
                 let wt = &worktrees[0];
                 let wt_path = wt.path.clone();
                 let branch = wt.short_branch_name().to_string();
-                if self.try_recover_then_switch(&path, &wt_path, &branch, cx) {
-                    return;
-                }
-                self.switch_to_worktree(&wt_path, &branch, cx);
+                self.schedule_switch_to_worktree_async(&path, &wt_path, &branch, 0, cx);
                 return;
             }
-            if self.try_recover_then_start(&path, &name, cx) {
-                return;
-            }
-            self.start_local_session(&path, "main", cx);
+            self.schedule_start_main_session(&path, cx);
         }
-
     }
 
     fn setup_local_terminal(
@@ -528,18 +514,91 @@ impl AppRoot {
         cx: &mut Context<Self>,
     ) {
         let pane_target_str = pane_target.to_string();
-        let (cols, rows) = self
-            .preferred_terminal_dims
-            .unwrap_or_else(|| runtime.get_pane_dimensions(&pane_target_str));
+        let fallback_dims = self.resolve_terminal_dims();
+        let actual_dims = runtime.get_pane_dimensions(&pane_target_str);
+        // Use GPUI/config dims as the authoritative rendering size.
+        // Only fall back to tmux query when GPUI dims are unavailable (80x24).
+        let (cols, rows) = if fallback_dims != (80, 24) {
+            fallback_dims
+        } else if actual_dims.0 > 0 && actual_dims.1 > 0 && actual_dims != (80, 24) {
+            actual_dims
+        } else {
+            fallback_dims
+        };
 
-        if let Some((c, r)) = self.preferred_terminal_dims {
-            let _ = runtime.resize(&pane_target_str, c, r);
+        // #region agent log
+        crate::debug_log::dbg_session_log(
+            "app_root.rs:setup_local_terminal",
+            "terminal dims and pane_target",
+            &serde_json::json!({
+                "pane_target": &pane_target_str,
+                "cols": cols, "rows": rows,
+                "actual_pane_dims": format!("{}x{}", actual_dims.0, actual_dims.1),
+                "fallback_dims": format!("{}x{}", fallback_dims.0, fallback_dims.1),
+                "preferred_dims": self.preferred_terminal_dims,
+            }),
+            "H4",
+        );
+        // #endregion
+
+        // Force the tmux window AND pane to the target size before capture.
+        // resize-window bypasses the client-size constraint that limits resize-pane.
+        let dims_match = actual_dims == (cols, rows);
+        if !dims_match {
+            if let Some((session, _)) = runtime.session_info() {
+                let wn = runtime.session_info().map(|(_, w)| w).unwrap_or_default();
+                let window_target = format!("{}:{}", session, wn);
+                let _ = std::process::Command::new("tmux")
+                    .args(["resize-window", "-t", &window_target,
+                           "-x", &cols.to_string(), "-y", &rows.to_string()])
+                    .output();
+            }
+            let _ = std::process::Command::new("tmux")
+                .args(["resize-pane", "-t", &pane_target_str,
+                       "-x", &cols.to_string(), "-y", &rows.to_string()])
+                .output();
+            // Wait for the shell to process SIGWINCH and redraw at the new size.
+            // Without this, capture-pane grabs content with stale cursor positions.
+            std::thread::sleep(std::time::Duration::from_millis(150));
         }
+        let _ = runtime.resize(&pane_target_str, cols, rows);
+
+        // Check if pane is now at the correct size after the resize attempts
+        let post_resize_dims = runtime.get_pane_dimensions(&pane_target_str);
+        let resize_succeeded = post_resize_dims == (cols, rows);
+
+        if !resize_succeeded {
+            runtime.set_skip_initial_capture();
+        }
+
+        // #region agent log
+        crate::debug_log::dbg_session_log(
+            "app_root.rs:setup_local_terminal",
+            "pre-subscribe state",
+            &serde_json::json!({
+                "dims_match": dims_match,
+                "skip_capture": !resize_succeeded,
+                "pane_target": &pane_target_str,
+                "post_resize_dims": format!("{}x{}", post_resize_dims.0, post_resize_dims.1),
+                "resize_succeeded": resize_succeeded,
+            }),
+            "H_skip",
+        );
+        // #endregion
 
         if let Some(rx) = runtime.subscribe_output(&pane_target_str) {
             let (rx1, rx2) = tee_output(rx);
             let reader = RuntimeReader::new(rx1);
             let writer = RuntimeWriter::new(runtime.clone(), pane_target_str.clone());
+
+            // #region agent log
+            crate::debug_log::dbg_session_log(
+                "app_root.rs:setup_local_terminal",
+                "initial PTY config",
+                &serde_json::json!({"cols": cols, "rows": rows}),
+                "H15",
+            );
+            // #endregion
 
             let config = TerminalConfig {
                 cols: cols as usize,
@@ -554,16 +613,25 @@ impl AppRoot {
 
             let runtime_for_resize = runtime.clone();
             let pane_for_resize = pane_target_str.clone();
+            let shared_dims_for_resize = Arc::clone(&self.shared_terminal_dims);
             let resize_callback = move |cols: usize, rows: usize| {
                 // #region agent log
                 crate::debug_log::dbg_session_log(
-                    "app_root.rs:resize_callback(local)",
+                    "app_root.rs:resize_callback(setup_local)",
                     "PTY resize fired",
-                    &serde_json::json!({"cols": cols, "rows": rows, "pane": &pane_for_resize}),
-                    "H8",
+                    &serde_json::json!({"cols": cols, "rows": rows}),
+                    "H15",
                 );
                 // #endregion
                 let _ = runtime_for_resize.resize(&pane_for_resize, cols as u16, rows as u16);
+                if let Ok(mut dims) = shared_dims_for_resize.lock() {
+                    *dims = Some((cols as u16, rows as u16));
+                }
+                if let Ok(mut cfg) = Config::load() {
+                    cfg.last_terminal_cols = Some(cols as u16);
+                    cfg.last_terminal_rows = Some(rows as u16);
+                    let _ = cfg.save();
+                }
             };
 
             let gpui_terminal_entity = cx.new(|cx| {
@@ -574,6 +642,20 @@ impl AppRoot {
             if let Ok(mut buffers) = self.terminal_buffers.lock() {
                 buffers.clear();
                 buffers.insert(pane_target_str.clone(), TerminalBuffer::GpuiTerminal(gpui_terminal_entity));
+            }
+
+            // When capture was skipped (resize failed), send C-l to make
+            // the shell clear and redraw at the correct pane dimensions.
+            if !resize_succeeded {
+                let _ = runtime.send_key(&pane_target_str, "C-l", false);
+                // #region agent log
+                crate::debug_log::dbg_session_log(
+                    "app_root.rs:setup_local_terminal",
+                    "sent C-l for redraw (resize failed)",
+                    &serde_json::json!({"pane_target": &pane_target_str}),
+                    "H_redraw",
+                );
+                // #endregion
             }
 
             let status_publisher = self.status_publisher.clone();
@@ -716,6 +798,19 @@ impl AppRoot {
         cx: &mut Context<Self>,
         saved_split_tree: Option<SplitNode>,
     ) {
+        // #region agent log
+        crate::debug_log::dbg_session_log(
+            "app_root.rs:attach_runtime",
+            "attaching runtime",
+            &serde_json::json!({
+                "backend_type": runtime.backend_type(),
+                "pane_target": &pane_target,
+                "worktree_path": worktree_path.to_string_lossy(),
+                "branch_name": branch_name,
+            }),
+            "H_backend",
+        );
+        // #endregion
         self.runtime = Some(runtime.clone());
 
         let (split_tree, pane_targets): (SplitNode, Vec<String>) = match saved_split_tree {
@@ -762,7 +857,7 @@ impl AppRoot {
         let on_ratio = Arc::new(move |path: Vec<bool>, ratio: f32, _w: &mut Window, cx: &mut App| {
             let _ = cx.update_entity(&app_root_entity, |this: &mut AppRoot, cx| {
                 this.split_tree.update_ratio(&path, ratio);
-                if let Ok(mut guard) = term_entity_holder_for_ratio.lock() {
+                if let Ok(guard) = term_entity_holder_for_ratio.lock() {
                     if let Some(ref e) = *guard {
                         let _ = cx.update_entity(e, |ent: &mut TerminalAreaEntity, cx| {
                             ent.set_split_tree(this.split_tree.clone());
@@ -776,7 +871,7 @@ impl AppRoot {
         let on_drag_start = Arc::new(move |path: Vec<bool>, pos: f32, ratio: f32, vert: bool, _w: &mut Window, cx: &mut App| {
             let _ = cx.update_entity(&app_root_for_drag, |this: &mut AppRoot, cx| {
                 this.split_divider_drag = Some((path.clone(), pos, ratio, vert));
-                if let Ok(mut guard) = term_entity_holder_for_drag.lock() {
+                if let Ok(guard) = term_entity_holder_for_drag.lock() {
                     if let Some(ref e) = *guard {
                         let _ = cx.update_entity(e, |ent: &mut TerminalAreaEntity, cx| {
                             ent.set_split_divider_drag(Some((path, pos, ratio, vert)));
@@ -790,7 +885,7 @@ impl AppRoot {
         let on_drag_end = Arc::new(move |_w: &mut Window, cx: &mut App| {
             let _ = cx.update_entity(&app_root_for_drag_end, |this: &mut AppRoot, cx| {
                 this.split_divider_drag = None;
-                if let Ok(mut guard) = term_entity_holder_for_drag_end.lock() {
+                if let Ok(guard) = term_entity_holder_for_drag_end.lock() {
                     if let Some(ref e) = *guard {
                         let _ = cx.update_entity(e, |ent: &mut TerminalAreaEntity, cx| {
                             ent.set_split_divider_drag(None);
@@ -895,7 +990,15 @@ impl AppRoot {
             .map(|t| t.path.clone())
             .unwrap_or_else(|| worktree_path.to_path_buf());
         let config = Config::load().ok();
-        let result = match create_runtime_from_env(&workspace_path, worktree_path, branch_name, 80, 24, config.as_ref()) {
+        let (init_cols, init_rows) = self.preferred_terminal_dims.unwrap_or_else(|| {
+            config.as_ref()
+                .and_then(|c| match (c.last_terminal_cols, c.last_terminal_rows) {
+                    (Some(cols), Some(rows)) => Some((cols, rows)),
+                    _ => None,
+                })
+                .unwrap_or((80, 24))
+        });
+        let result = match create_runtime_from_env(&workspace_path, worktree_path, branch_name, init_cols, init_rows, config.as_ref()) {
             Ok(r) => r,
             Err(e) => {
                 self.state.error_message = Some(format!("Runtime error: {}", e));
@@ -1055,13 +1158,33 @@ impl AppRoot {
         !self.workspace_manager.is_empty()
     }
 
+    #[allow(dead_code)]
     fn effective_backend(&self) -> String {
         crate::runtime::backends::resolve_backend(
             crate::config::Config::load().ok().as_ref(),
         )
     }
 
+    fn resolve_terminal_dims(&self) -> (u16, u16) {
+        self.preferred_terminal_dims
+            .or_else(|| {
+                if let Ok(dims) = self.shared_terminal_dims.lock() {
+                    *dims
+                } else {
+                    None
+                }
+            })
+            .or_else(|| {
+                Config::load().ok().and_then(|c| match (c.last_terminal_cols, c.last_terminal_rows) {
+                    (Some(cols), Some(rows)) => Some((cols, rows)),
+                    _ => None,
+                })
+            })
+            .unwrap_or((120, 36))
+    }
+
     /// Try recover from runtime_state. For local PTY, always returns false (no session recovery).
+    #[allow(dead_code)]
     fn try_recover_then_switch(
         &mut self,
         workspace_path: &Path,
@@ -1069,7 +1192,8 @@ impl AppRoot {
         branch_name: &str,
         cx: &mut Context<Self>,
     ) -> bool {
-        if self.effective_backend() != "tmux" {
+        let backend = self.effective_backend();
+        if backend != "tmux" && backend != "tmux-cc" {
             return false;
         }
         let state = match RuntimeState::load() {
@@ -1090,20 +1214,22 @@ impl AppRoot {
             None => return false,
         };
 
+        let (cols, rows) = self.resolve_terminal_dims();
         let runtime = match recover_runtime(
             &worktree.backend,
             worktree,
             Some(Arc::clone(&self.event_bus)),
+            cols,
+            rows,
         ) {
             Ok(rt) => rt,
             Err(_) => return false,
         };
 
-        let pane_target = worktree
-            .pane_ids
-            .first()
-            .cloned()
-            .or_else(|| runtime.primary_pane_id())
+        // Always prefer live pane IDs — saved IDs may be stale after session recreation
+        let pane_target = runtime
+            .primary_pane_id()
+            .or_else(|| worktree.pane_ids.first().cloned())
             .unwrap_or_else(|| format!("local:{}", worktree_path.display()));
 
         let saved_split_tree = worktree
@@ -1116,13 +1242,15 @@ impl AppRoot {
     }
 
     /// Try recover for repo-only (no worktrees). For local PTY, always returns false.
+    #[allow(dead_code)]
     fn try_recover_then_start(
         &mut self,
         workspace_path: &Path,
         _repo_name: &str,
         cx: &mut Context<Self>,
     ) -> bool {
-        if self.effective_backend() != "tmux" {
+        let backend = self.effective_backend();
+        if backend != "tmux" && backend != "tmux-cc" {
             return false;
         }
         let state = match RuntimeState::load() {
@@ -1139,20 +1267,22 @@ impl AppRoot {
             None => return false,
         };
 
+        let (cols, rows) = self.resolve_terminal_dims();
         let runtime = match recover_runtime(
             &worktree.backend,
             worktree,
             Some(Arc::clone(&self.event_bus)),
+            cols,
+            rows,
         ) {
             Ok(rt) => rt,
             Err(_) => return false,
         };
 
-        let pane_target = worktree
-            .pane_ids
-            .first()
-            .cloned()
-            .or_else(|| runtime.primary_pane_id())
+        // Always prefer live pane IDs — saved IDs may be stale after session recreation
+        let pane_target = runtime
+            .primary_pane_id()
+            .or_else(|| worktree.pane_ids.first().cloned())
             .unwrap_or_else(|| format!("local:{}", worktree.path.display()));
 
         let saved_split_tree = worktree
@@ -1289,17 +1419,43 @@ impl AppRoot {
     }
 
     /// Switch to a specific worktree (spawn new shell for worktree).
-    /// Backend is selected via PMUX_BACKEND env var (local or tmux).
+    /// Reuses existing -CC connection when switching within the same tmux session.
     fn switch_to_worktree(&mut self, worktree_path: &Path, branch_name: &str, cx: &mut Context<Self>) {
-        self.stop_current_session();
-
         let workspace_path = self
             .workspace_manager
             .active_tab()
             .map(|t| t.path.clone())
             .unwrap_or_else(|| worktree_path.to_path_buf());
+
+        // Reuse existing runtime if same tmux session
+        if self.current_runtime_matches_session(&workspace_path) {
+            let runtime = self.runtime.as_ref().unwrap().clone();
+            let window_name = window_name_for_worktree(worktree_path, branch_name);
+            self.detach_ui_from_runtime();
+            if let Err(e) = runtime.switch_window(&window_name, Some(worktree_path)) {
+                self.runtime = None;
+                self.state.error_message = Some(format!("Window switch error: {}", e));
+                return;
+            }
+            let pane_target = runtime
+                .primary_pane_id()
+                .unwrap_or_else(|| format!("local:{}", worktree_path.display()));
+            self.attach_runtime(runtime, pane_target, worktree_path, branch_name, cx, None);
+            return;
+        }
+
+        self.stop_current_session();
+
         let config = Config::load().ok();
-        let result = match create_runtime_from_env(&workspace_path, worktree_path, branch_name, 80, 24, config.as_ref()) {
+        let (init_cols, init_rows) = self.preferred_terminal_dims.unwrap_or_else(|| {
+            config.as_ref()
+                .and_then(|c| match (c.last_terminal_cols, c.last_terminal_rows) {
+                    (Some(cols), Some(rows)) => Some((cols, rows)),
+                    _ => None,
+                })
+                .unwrap_or((80, 24))
+        });
+        let result = match create_runtime_from_env(&workspace_path, worktree_path, branch_name, init_cols, init_rows, config.as_ref()) {
             Ok(r) => r,
             Err(e) => {
                 self.state.error_message = Some(format!(
@@ -1322,8 +1478,18 @@ impl AppRoot {
         self.attach_runtime(runtime, pane_target, worktree_path, branch_name, cx, None);
     }
 
+    /// Check if the current runtime is a tmux session for the given workspace.
+    fn current_runtime_matches_session(&self, workspace_path: &std::path::Path) -> bool {
+        if let Some(ref rt) = self.runtime {
+            if let Some((session, _)) = rt.session_info() {
+                return session == session_name_for_workspace(workspace_path);
+            }
+        }
+        false
+    }
+
     /// Process pending worktree selection (called from render context).
-    /// Runs runtime creation in background; shows loading state immediately.
+    /// Reuses the existing -CC connection when switching worktrees within the same session.
     fn process_pending_worktree_selection(&mut self, cx: &mut Context<Self>) {
         let idx = match self.pending_worktree_selection.take() {
             Some(i) => i,
@@ -1349,20 +1515,99 @@ impl AppRoot {
 
         self.active_worktree_index = Some(idx);
         self.worktree_switch_loading = Some(idx);
-        self.stop_current_session();
-        cx.notify();
 
         let workspace_path = self
             .workspace_manager
             .active_tab()
             .map(|t| t.path.clone())
             .unwrap_or_else(|| repo_path.clone());
+
+        // Reuse existing runtime if switching worktrees within the same tmux session
+        if self.current_runtime_matches_session(&workspace_path) {
+            let runtime = self.runtime.as_ref().unwrap().clone();
+            let window_name = window_name_for_worktree(&path, &branch);
+            // #region agent log
+            crate::debug_log::dbg_session_log(
+                "app_root.rs:process_pending_worktree_selection",
+                "detach_ui_from_runtime START (reuse session path)",
+                &serde_json::json!({"window_name": &window_name, "branch": &branch, "idx": idx}),
+                "H2",
+            );
+            // #endregion
+            self.detach_ui_from_runtime();
+            cx.notify();
+
+            let path_clone = path.clone();
+            let branch_clone = branch.clone();
+            cx.spawn(async move |entity, cx| {
+                // #region agent log
+                crate::debug_log::dbg_session_log(
+                    "app_root.rs:process_pending_worktree_selection:async",
+                    "switch_window START",
+                    &serde_json::json!({"window_name": &window_name}),
+                    "H2",
+                );
+                // #endregion
+                let wn = window_name.clone();
+                let pc = path_clone.clone();
+                let switch_result = blocking::unblock(move || {
+                    runtime.switch_window(&wn, Some(&pc))
+                }).await;
+
+                let _ = entity.update(cx, |this: &mut AppRoot, cx| {
+                    this.worktree_switch_loading = None;
+                    // #region agent log
+                    crate::debug_log::dbg_session_log(
+                        "app_root.rs:process_pending_worktree_selection:async",
+                        "switch_window DONE, calling attach_runtime",
+                        &serde_json::json!({"ok": switch_result.is_ok()}),
+                        "H2",
+                    );
+                    // #endregion
+                    match switch_result {
+                        Ok(()) => {
+                            let rt = this.runtime.as_ref().unwrap().clone();
+                            let pane_target = rt
+                                .primary_pane_id()
+                                .unwrap_or_else(|| format!("local:{}", path.display()));
+                            // #region agent log
+                            crate::debug_log::dbg_session_log(
+                                "app_root.rs:process_pending_worktree_selection:async",
+                                "attach_runtime with pane_target",
+                                &serde_json::json!({"pane_target": &pane_target}),
+                                "H3",
+                            );
+                            // #endregion
+                            this.attach_runtime(rt, pane_target, &path, &branch_clone, cx, None);
+                        }
+                        Err(e) => {
+                            this.state.error_message = Some(format!("Window switch error: {}", e));
+                        }
+                    }
+                    cx.notify();
+                });
+            }).detach();
+            return;
+        }
+
+        self.stop_current_session();
+        cx.notify();
+
         let config = Config::load().ok();
+        let saved_dims = self.preferred_terminal_dims.unwrap_or_else(|| {
+            config.as_ref()
+                .and_then(|c| match (c.last_terminal_cols, c.last_terminal_rows) {
+                    (Some(cols), Some(rows)) => Some((cols, rows)),
+                    _ => None,
+                })
+                .unwrap_or((80, 24))
+        });
         cx.spawn(async move |entity, cx| {
             let path_clone = path.clone();
             let branch_clone = branch.clone();
+            let (ic, ir) = saved_dims;
             let result = blocking::unblock(move || {
-                create_runtime_from_env(&workspace_path, &path_clone, &branch_clone, 80, 24, config.as_ref())
+                create_runtime_from_env(&workspace_path, &path_clone, &branch_clone, ic, ir, config.as_ref())
             })
             .await;
 
@@ -1396,7 +1641,7 @@ impl AppRoot {
     }
 
     /// Schedule async switch to worktree (avoids blocking main thread on create_runtime).
-    /// Shows loading state immediately; attach_runtime runs when creation completes.
+    /// Reuses existing -CC connection when switching within the same tmux session.
     fn schedule_switch_to_worktree_async(
         &mut self,
         workspace_path: &Path,
@@ -1408,15 +1653,117 @@ impl AppRoot {
         self.worktree_switch_loading = Some(worktree_idx);
         cx.notify();
 
+        // #region agent log
+        {
+            let has_rt = self.runtime.is_some();
+            let rt_type = self.runtime.as_ref().map(|r| r.backend_type()).unwrap_or("none");
+            let session_match = self.current_runtime_matches_session(workspace_path);
+            crate::debug_log::dbg_session_log(
+                "app_root.rs:schedule_switch_to_worktree_async",
+                "entry",
+                &serde_json::json!({
+                    "has_runtime": has_rt,
+                    "runtime_type": rt_type,
+                    "session_match": session_match,
+                    "worktree_idx": worktree_idx,
+                    "workspace_path": workspace_path.to_string_lossy(),
+                    "worktree_path": worktree_path.to_string_lossy(),
+                }),
+                "H_backend",
+            );
+        }
+        // #endregion
+
+        // Reuse existing runtime if same tmux session
+        if self.current_runtime_matches_session(workspace_path) {
+            let runtime = self.runtime.as_ref().unwrap().clone();
+            let window_name = window_name_for_worktree(worktree_path, branch_name);
+            // #region agent log
+            crate::debug_log::dbg_session_log(
+                "app_root.rs:switch_reuse",
+                "session matches – reuse path",
+                &serde_json::json!({
+                    "window_name": &window_name,
+                    "worktree_path": worktree_path.to_string_lossy(),
+                }),
+                "H_switch1",
+            );
+            // #endregion
+            self.detach_ui_from_runtime();
+
+            let worktree_path = worktree_path.to_path_buf();
+            let branch_name = branch_name.to_string();
+            cx.spawn(async move |entity, cx| {
+                let wn = window_name.clone();
+                let pc = worktree_path.clone();
+                // #region agent log
+                let t0 = std::time::Instant::now();
+                // #endregion
+                let switch_result = blocking::unblock(move || {
+                    runtime.switch_window(&wn, Some(&pc))
+                }).await;
+
+                let _ = entity.update(cx, |this: &mut AppRoot, cx| {
+                    this.worktree_switch_loading = None;
+                    // #region agent log
+                    let elapsed = t0.elapsed().as_millis();
+                    crate::debug_log::dbg_session_log(
+                        "app_root.rs:switch_reuse",
+                        "switch_window completed",
+                        &serde_json::json!({
+                            "elapsed_ms": elapsed,
+                            "ok": switch_result.is_ok(),
+                            "err": switch_result.as_ref().err().map(|e| e.to_string()),
+                        }),
+                        "H_switch2",
+                    );
+                    // #endregion
+                    match switch_result {
+                        Ok(()) => {
+                            let rt = this.runtime.as_ref().unwrap().clone();
+                            let pane_target = rt
+                                .primary_pane_id()
+                                .unwrap_or_else(|| format!("local:{}", worktree_path.display()));
+                            // #region agent log
+                            crate::debug_log::dbg_session_log(
+                                "app_root.rs:switch_reuse",
+                                "attaching after switch",
+                                &serde_json::json!({
+                                    "pane_target": &pane_target,
+                                }),
+                                "H_switch3",
+                            );
+                            // #endregion
+                            this.attach_runtime(rt, pane_target, &worktree_path, &branch_name, cx, None);
+                        }
+                        Err(e) => {
+                            this.state.error_message = Some(format!("Window switch error: {}", e));
+                        }
+                    }
+                    cx.notify();
+                });
+            }).detach();
+            return;
+        }
+
         let workspace_path = workspace_path.to_path_buf();
         let worktree_path = worktree_path.to_path_buf();
         let branch_name = branch_name.to_string();
         let config = Config::load().ok();
+        let saved_dims = self.preferred_terminal_dims.unwrap_or_else(|| {
+            config.as_ref()
+                .and_then(|c| match (c.last_terminal_cols, c.last_terminal_rows) {
+                    (Some(cols), Some(rows)) => Some((cols, rows)),
+                    _ => None,
+                })
+                .unwrap_or((80, 24))
+        });
         cx.spawn(async move |entity, cx| {
             let path_clone = worktree_path.clone();
             let branch_clone = branch_name.clone();
+            let (ic, ir) = saved_dims;
             let result = blocking::unblock(move || {
-                create_runtime_from_env(&workspace_path, &path_clone, &branch_clone, 80, 24, config.as_ref())
+                create_runtime_from_env(&workspace_path, &path_clone, &branch_clone, ic, ir, config.as_ref())
             })
             .await;
 
@@ -1456,10 +1803,19 @@ impl AppRoot {
 
         let repo_path = repo_path.to_path_buf();
         let repo_path_clone = repo_path.clone();
+        let saved_dims = self.preferred_terminal_dims.unwrap_or_else(|| {
+            Config::load().ok()
+                .and_then(|c| match (c.last_terminal_cols, c.last_terminal_rows) {
+                    (Some(cols), Some(rows)) => Some((cols, rows)),
+                    _ => None,
+                })
+                .unwrap_or((80, 24))
+        });
         cx.spawn(async move |entity, cx| {
+            let (ic, ir) = saved_dims;
             let result = blocking::unblock(move || {
                 let config = Config::load().ok();
-                create_runtime_from_env(&repo_path, &repo_path, "main", 80, 24, config.as_ref())
+                create_runtime_from_env(&repo_path, &repo_path, "main", ic, ir, config.as_ref())
             })
             .await;
 
@@ -1530,11 +1886,10 @@ impl AppRoot {
         self.status_counts = counts;
     }
 
-    /// Stop current session.
-    /// Does NOT clear pane_statuses - preserves last known status for worktrees we're leaving
-    /// (avoids flicker: main=Idle, switch to feature/test → main stays Idle, feature/test gets its status)
-    fn stop_current_session(&mut self) {
-        self.preferred_terminal_dims = self.resize_controller.last_dims();
+    /// Detach UI components from the runtime without dropping it.
+    /// Used when switching worktrees within the same session — the -CC
+    /// connection stays alive, only the terminal UI is torn down.
+    fn detach_ui_from_runtime(&mut self) {
         self.resize_controller.reset_for_new_session();
         self.status_publisher.take();
         self.terminal_area_entity.take();
@@ -1549,8 +1904,15 @@ impl AppRoot {
             }
         }
 
-        self.runtime = None;
         self.active_pane_target = None;
+    }
+
+    /// Stop current session.
+    /// Does NOT clear pane_statuses - preserves last known status for worktrees we're leaving
+    /// (avoids flicker: main=Idle, switch to feature/test → main stays Idle, feature/test gets its status)
+    fn stop_current_session(&mut self) {
+        self.detach_ui_from_runtime();
+        self.runtime = None;
     }
 
     /// Handle keyboard events
@@ -1672,23 +2034,6 @@ impl AppRoot {
             }
             _ => {
                 if !modifiers.platform {
-                    // #region agent log
-                    static DROP_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-                    let c = DROP_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    if c < 5 {
-                        crate::debug_log::dbg_session_log(
-                            "app_root.rs:handle_key_down",
-                            "key not forwarded",
-                            &serde_json::json!({
-                                "key": key_name,
-                                "runtime": self.runtime.is_some(),
-                                "target": self.active_pane_target.as_deref().unwrap_or("none"),
-                                "count": c + 1
-                            }),
-                            "H_keyboard",
-                        );
-                    }
-                    // #endregion
                     eprintln!(
                         "pmux: key '{}' not forwarded (runtime={} target={})",
                         key_name,
@@ -1900,6 +2245,7 @@ impl AppRoot {
     }
 
     /// Closes the new branch dialog
+    #[allow(dead_code)]
     fn close_new_branch_dialog(&mut self, cx: &mut Context<Self>) {
         if let Some(ref model) = self.new_branch_dialog_model {
             let _ = cx.update_entity(model, |m, cx| {
@@ -2709,8 +3055,6 @@ impl Render for AppRoot {
                         self.split_tree.flatten().into_iter().map(|(t, _)| t).collect();
                     let runtime = self.runtime.clone();
                     let entity = cx.entity();
-                    let cols_log = cols;
-                    let rows_log = rows;
                     window.on_next_frame(move |_window, cx| {
                         if let Some(ref rt) = runtime {
                             for pane_target in &pane_targets {
@@ -2720,7 +3064,6 @@ impl Render for AppRoot {
                         // GpuiTerminal: resize handled via with_resize_callback in TerminalView
                         let _ = entity.update(cx, |this, cx| {
                             this.resize_controller.set_pending(false);
-                            this.preferred_terminal_dims = Some((cols_log, rows_log));
                             cx.notify();
                         });
                     });
@@ -2735,19 +3078,11 @@ impl Render for AppRoot {
         // For GpuiTerminal, focus the terminal entity itself so it receives key events.
         // Use double on_next_frame so terminal DOM is fully mounted after worktree switch.
         if self.has_workspaces() && self.terminal_needs_focus {
-            // #region agent log
-            crate::debug_log::dbg_session_log(
-                "app_root.rs:render",
-                "terminal_needs_focus triggered in render",
-                &serde_json::json!({"target": self.active_pane_target.as_deref().unwrap_or("none")}),
-                "H2",
-            );
-            // #endregion
             self.terminal_needs_focus = false;
             let target = self.active_pane_target.clone();
             let buffers = self.terminal_buffers.clone();
             let terminal_focus_for_frame = terminal_focus.clone();
-            window.on_next_frame(move |window, cx| {
+            window.on_next_frame(move |window, _cx| {
                 let target = target.clone();
                 let buffers = buffers.clone();
                 let terminal_focus_for_inner = terminal_focus_for_frame.clone();

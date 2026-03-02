@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 /// NewBranchDialog Entity - observes NewBranchDialogModel; re-renders when model notifies.
 pub struct NewBranchDialogEntity {
+    #[allow(dead_code)]
     model: Entity<NewBranchDialogModel>,
     is_open: bool,
     branch_name: String,
@@ -68,7 +69,7 @@ impl Render for NewBranchDialogEntity {
         let branch_name = self.branch_name.clone();
         let error = self.error.clone();
         let is_creating = self.is_creating;
-        let is_create_enabled = !is_creating && !branch_name.trim().is_empty() && error.is_empty();
+        let _is_create_enabled = !is_creating && !branch_name.trim().is_empty() && error.is_empty();
         let input_focus = self.input_focus.clone();
 
         let mut ui = NewBranchDialogUi::new()

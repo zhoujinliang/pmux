@@ -54,18 +54,6 @@ impl RuntimeWriter {
 
 impl Write for RuntimeWriter {
     fn write(&mut self, buf: &[u8]) -> IoResult<usize> {
-        // #region agent log
-        {
-            let is_enter = buf == b"\r" || buf == b"\n" || buf == b"\r\n";
-            let preview = if buf.len() <= 20 { format!("{:?}", buf) } else { format!("{:?}...", &buf[..20]) };
-            crate::debug_log::dbg_session_log(
-                "stream_adapter.rs:RuntimeWriter::write",
-                "gpui_terminal write to PTY",
-                &serde_json::json!({"bytes_len": buf.len(), "is_enter": is_enter, "preview": preview, "pane_id": self.pane_id}),
-                "H1",
-            );
-        }
-        // #endregion
         self.runtime
             .send_input(&self.pane_id, buf)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
@@ -83,7 +71,28 @@ pub fn tee_output(rx: flume::Receiver<Vec<u8>>) -> (flume::Receiver<Vec<u8>>, fl
     let (tx1, rx1) = flume::unbounded();
     let (tx2, rx2) = flume::unbounded();
     std::thread::spawn(move || {
+        // #region agent log
+        let mut chunk_count: u64 = 0;
+        let mut total_bytes: u64 = 0;
+        // #endregion
         while let Ok(chunk) = rx.recv() {
+            // #region agent log
+            chunk_count += 1;
+            total_bytes += chunk.len() as u64;
+            if chunk_count <= 3 || (chunk_count % 50 == 0) {
+                crate::debug_log::dbg_session_log(
+                    "stream_adapter.rs:tee_output",
+                    "chunk forwarded",
+                    &serde_json::json!({
+                        "chunk_count": chunk_count,
+                        "chunk_len": chunk.len(),
+                        "total_bytes": total_bytes,
+                        "preview": String::from_utf8_lossy(&chunk[..chunk.len().min(80)]).to_string()
+                    }),
+                    "H_output_flow",
+                );
+            }
+            // #endregion
             let _ = tx1.send(chunk.clone());
             let _ = tx2.send(chunk);
         }
