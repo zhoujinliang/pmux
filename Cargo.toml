@@ -30,7 +30,6 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "blo
 open = "5"
 tokio-tungstenite = { version = "0.21", features = ["native-tls"] }
 futures-util = "0.3"
-gpui-terminal = { path = "vendor/gpui-terminal" }
 alacritty_terminal = "0.25"
 parking_lot = "0.12"
 

@@ -23,7 +23,6 @@ use crate::new_branch_orchestrator::{NewBranchOrchestrator, CreationResult, Noti
 use crate::notification::Notification;
 use gpui::prelude::FluentBuilder;
 use gpui::*;
-use gpui_terminal::{ColorPalette, TerminalConfig};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -928,12 +927,6 @@ impl AppRoot {
                     if let Ok(buffers) = this.terminal_buffers.lock() {
                         if let Some(TerminalBuffer::Terminal { focus_handle, .. }) = buffers.get(&target) {
                             window.focus(focus_handle, cx);
-                        } else if let Some(TerminalBuffer::GpuiTerminal(entity)) = buffers.get(&target) {
-                            let entity = entity.clone();
-                            drop(buffers);
-                            entity.update(cx, |term, cx| {
-                                window.focus(term.focus_handle(), cx);
-                            });
                         } else {
                             drop(buffers);
                             if let Some(ref focus) = terminal_focus {
@@ -2043,14 +2036,6 @@ impl AppRoot {
                 let bytes_opt = bytes_opt.or_else(|| key_to_xterm_escape(&key_name, modifiers));
 
                 if let Some(bytes) = bytes_opt {
-                    if let Ok(buffers) = self.terminal_buffers.lock() {
-                        if let Some(TerminalBuffer::GpuiTerminal(entity)) = buffers.get(target) {
-                            let focused = entity.read(cx).focus_handle().is_focused(window);
-                            if focused {
-                                return; // gpui_terminal already handled this key
-                            }
-                        }
-                    }
                     let send_result = runtime.send_input(target, &bytes);
                     if let Err(e) = send_result {
                         eprintln!("pmux: send_input failed: {}", e);
@@ -2968,12 +2953,6 @@ impl AppRoot {
                                                         if let Ok(buffers) = this.terminal_buffers.lock() {
                                                             if let Some(TerminalBuffer::Terminal { focus_handle, .. }) = buffers.get(&target) {
                                                                 window.focus(focus_handle, cx);
-                                                            } else if let Some(TerminalBuffer::GpuiTerminal(entity)) = buffers.get(&target) {
-                                                                let entity = entity.clone();
-                                                                drop(buffers);
-                                                                entity.update(cx, |term, cx| {
-                                                                    window.focus(term.focus_handle(), cx);
-                                                                });
                                                             } else {
                                                                 drop(buffers);
                                                                 window.focus(&terminal_focus_for_pane, cx);
@@ -3087,7 +3066,7 @@ impl Render for AppRoot {
                                 let _ = rt.resize(pane_target, cols, rows);
                             }
                         }
-                        // GpuiTerminal: resize handled via with_resize_callback in TerminalView
+                        // Terminal: resize handled via with_resize_callback in TerminalElement
                         let _ = entity.update(cx, |this, cx| {
                             this.resize_controller.set_pending(false);
                             cx.notify();
@@ -3101,7 +3080,6 @@ impl Render for AppRoot {
         let terminal_focus = self.terminal_focus.get_or_insert_with(|| cx.focus_handle()).clone();
 
         // Auto-focus terminal when workspace loads so keyboard input works without clicking.
-        // For GpuiTerminal, focus the terminal entity itself so it receives key events.
         // Use double on_next_frame so terminal DOM is fully mounted after worktree switch.
         if self.has_workspaces() && self.terminal_needs_focus {
             self.terminal_needs_focus = false;
@@ -3118,13 +3096,6 @@ impl Render for AppRoot {
                     });
                     if let Some(TerminalBuffer::Terminal { focus_handle, .. }) = buf {
                         window.focus(&focus_handle, cx);
-                        return;
-                    }
-                    if let Some(TerminalBuffer::GpuiTerminal(entity)) = buf {
-                        let entity = entity.clone();
-                        entity.update(cx, |term, cx| {
-                            window.focus(term.focus_handle(), cx);
-                        });
                         return;
                     }
                     window.focus(&terminal_focus_for_inner, cx);

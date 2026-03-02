@@ -212,19 +212,14 @@ impl SplitPaneContainer {
                             cb(pane_idx, window, cx);
                         }
                     });
-                // GpuiTerminal: render entity directly. Error/Empty: use TerminalView wrapper.
-                let content = if let TerminalBuffer::GpuiTerminal(entity) = &buffer {
-                    pane_div.child(entity.clone()).into_any_element()
-                } else {
-                    pane_div
-                        .child(
-                            TerminalView::with_buffer(target, &title, buffer.clone())
-                                .with_focused(is_focused)
-                                .with_cursor_visible(cursor_blink_visible)
-                                .into_element(),
-                        )
-                        .into_any_element()
-                };
+                let content = pane_div
+                    .child(
+                        TerminalView::with_buffer(target, &title, buffer.clone())
+                            .with_focused(is_focused)
+                            .with_cursor_visible(cursor_blink_visible)
+                            .into_element(),
+                    )
+                    .into_any_element();
                 content
             }
             SplitNode::Vertical { ratio, left, right } => {
