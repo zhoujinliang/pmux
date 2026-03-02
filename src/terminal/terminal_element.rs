@@ -20,6 +20,7 @@ pub struct TerminalElement {
     search_current: Option<usize>,
     links: Vec<DetectedLink>,
     hovered_link: Option<usize>,
+    focused: bool,
 }
 
 impl TerminalElement {
@@ -34,6 +35,7 @@ impl TerminalElement {
             search_current: None,
             links: Vec::new(),
             hovered_link: None,
+            focused: true,
         }
     }
 
@@ -51,6 +53,11 @@ impl TerminalElement {
     pub fn with_links(mut self, links: Vec<DetectedLink>, hovered: Option<usize>) -> Self {
         self.links = links;
         self.hovered_link = hovered;
+        self
+    }
+
+    pub fn with_focused(mut self, focused: bool) -> Self {
+        self.focused = focused;
         self
     }
 }
@@ -417,6 +424,18 @@ impl Element for TerminalElement {
                 cursor_bounds,
                 px(0.0),
                 cursor_color,
+                Edges::default(),
+                transparent_black(),
+                Default::default(),
+            ));
+        }
+
+        // Focus fog: dim unfocused panes
+        if !self.focused {
+            window.paint_quad(quad(
+                Bounds::new(origin, bounds.size),
+                px(0.0),
+                Hsla { h: 0.0, s: 0.0, l: 0.0, a: 0.15 },
                 Edges::default(),
                 transparent_black(),
                 Default::default(),

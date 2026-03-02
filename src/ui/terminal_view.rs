@@ -164,6 +164,7 @@ impl RenderOnce for TerminalView {
                     focus_handle.clone(),
                     ColorPalette::default(),
                 )
+                .with_focused(self.is_focused)
                 .with_search(matches, search_current)
                 .with_links(links, None);
                 if let Some(cb) = resize_callback {
