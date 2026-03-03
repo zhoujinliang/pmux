@@ -226,6 +226,8 @@ pub struct TmuxControlModeRuntime {
 
 /// Build tmux send-keys commands for the given input bytes.
 /// Pure function — no I/O, no locks.
+/// Kept for backward reference; writer thread uses build_hex_send_keys.
+#[allow(dead_code)]
 fn build_send_keys_commands(pane_id: &str, bytes: &[u8]) -> Vec<String> {
     let mut commands = Vec::new();
     if bytes.is_empty() {
@@ -305,6 +307,31 @@ fn build_send_keys_commands(pane_id: &str, bytes: &[u8]) -> Vec<String> {
         }
     }
     commands
+}
+
+/// Max raw bytes per single `send-keys -H` command.
+/// 512 bytes → ~1600 hex chars + prefix ≈ 1650 bytes, well within tmux's line buffer.
+const HEX_SEND_KEYS_CHUNK: usize = 512;
+
+/// Build tmux `send-keys -H` commands for the given input bytes.
+/// Encodes all bytes as hex, producing ONE command per chunk.
+/// This is faster than `build_send_keys_commands` because tmux processes
+/// one command instead of N (one per control character boundary).
+fn build_hex_send_keys(pane_id: &str, bytes: &[u8]) -> Vec<String> {
+    if bytes.is_empty() {
+        return Vec::new();
+    }
+    bytes
+        .chunks(HEX_SEND_KEYS_CHUNK)
+        .map(|chunk| {
+            let mut cmd = format!("send-keys -H -t {}", pane_id);
+            for &b in chunk {
+                use std::fmt::Write;
+                write!(cmd, " {:02x}", b).unwrap();
+            }
+            cmd
+        })
+        .collect()
 }
 
 /// Open a raw PTY pair with a specific window size. Returns (master_fd, slave_fd).
@@ -515,7 +542,7 @@ impl TmuxControlModeRuntime {
                 // Write all commands into a single buffer, then write_all + flush once
                 cmd_buf.clear();
                 for (pane_id, bytes) in &merged {
-                    for cmd in build_send_keys_commands(pane_id, bytes) {
+                    for cmd in build_hex_send_keys(pane_id, bytes) {
                         cmd_buf.extend_from_slice(cmd.as_bytes());
                         cmd_buf.push(b'\n');
                     }
@@ -1150,6 +1177,101 @@ mod tests {
 
         let _ = Command::new("tmux")
             .args(["kill-session", "-t", "pmux-test-dw"])
+            .output();
+    }
+
+    // ── Hex send-keys tests (no tmux required) ──────────────
+
+    #[test]
+    fn test_build_hex_send_keys_empty() {
+        let cmds = build_hex_send_keys("%0", &[]);
+        assert!(cmds.is_empty());
+    }
+
+    #[test]
+    fn test_build_hex_send_keys_printable() {
+        let cmds = build_hex_send_keys("%0", b"hello");
+        assert_eq!(cmds.len(), 1);
+        assert_eq!(cmds[0], "send-keys -H -t %0 68 65 6c 6c 6f");
+    }
+
+    #[test]
+    fn test_build_hex_send_keys_with_enter() {
+        let cmds = build_hex_send_keys("%0", b"ls\r");
+        assert_eq!(cmds.len(), 1);
+        assert_eq!(cmds[0], "send-keys -H -t %0 6c 73 0d");
+    }
+
+    #[test]
+    fn test_build_hex_send_keys_escape_sequence() {
+        let cmds = build_hex_send_keys("%0", b"\x1b[A");
+        assert_eq!(cmds.len(), 1);
+        assert_eq!(cmds[0], "send-keys -H -t %0 1b 5b 41");
+    }
+
+    #[test]
+    fn test_build_hex_send_keys_ctrl_c() {
+        let cmds = build_hex_send_keys("%0", b"\x03");
+        assert_eq!(cmds.len(), 1);
+        assert_eq!(cmds[0], "send-keys -H -t %0 03");
+    }
+
+    #[test]
+    fn test_build_hex_send_keys_utf8() {
+        let cmds = build_hex_send_keys("%0", "你".as_bytes());
+        assert_eq!(cmds.len(), 1);
+        assert_eq!(cmds[0], "send-keys -H -t %0 e4 bd a0");
+    }
+
+    #[test]
+    fn test_build_hex_send_keys_chunking() {
+        let data = vec![0x61u8; 600];
+        let cmds = build_hex_send_keys("%0", &data);
+        assert_eq!(cmds.len(), 2);
+        let hex_count_1 = cmds[0].trim_start_matches("send-keys -H -t %0 ")
+            .split_whitespace().count();
+        assert_eq!(hex_count_1, 512);
+        let hex_count_2 = cmds[1].trim_start_matches("send-keys -H -t %0 ")
+            .split_whitespace().count();
+        assert_eq!(hex_count_2, 88);
+    }
+
+    #[test]
+    fn test_hex_send_keys_roundtrip() {
+        if !crate::runtime::backends::tmux_available() {
+            eprintln!("skipping: tmux not available");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let rt = TmuxControlModeRuntime::new("pmux-test-hex", "main", Some(dir.path()), 80, 24)
+            .expect("should create runtime");
+
+        let panes = rt.list_panes(&String::new());
+        let pane_id = panes.first().cloned().unwrap_or_else(|| "%0".to_string());
+
+        let rx = rt.subscribe_output(&pane_id).expect("should get receiver");
+
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        while rx.try_recv().is_ok() {}
+
+        let input = b"echo HEX_OK\r";
+        rt.send_input(&pane_id, input).expect("send_input should work");
+
+        std::thread::sleep(std::time::Duration::from_millis(1000));
+        let mut output = Vec::new();
+        while let Ok(chunk) = rx.try_recv() {
+            output.extend_from_slice(&chunk);
+        }
+
+        let output_str = String::from_utf8_lossy(&output);
+        assert!(
+            output_str.contains("HEX_OK"),
+            "expected 'HEX_OK' in output, got: {}",
+            output_str
+        );
+
+        let _ = Command::new("tmux")
+            .args(["kill-session", "-t", "pmux-test-hex"])
             .output();
     }
 }
