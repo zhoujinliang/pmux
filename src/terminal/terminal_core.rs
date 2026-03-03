@@ -68,6 +68,8 @@ pub struct Terminal {
     /// Keep sender to maintain channel liveness; TermEventProxy uses a clone.
     #[allow(dead_code)]
     pty_write_tx: flume::Sender<Vec<u8>>,
+    cached_links: Mutex<Option<Vec<DetectedLink>>>,
+    cached_search: Mutex<Option<(String, Vec<SearchMatch>)>>,
 }
 
 impl Terminal {
@@ -95,6 +97,8 @@ impl Terminal {
             dirty: AtomicBool::new(false),
             pty_write_rx,
             pty_write_tx,
+            cached_links: Mutex::new(None),
+            cached_search: Mutex::new(None),
         }
     }
 
@@ -106,9 +110,14 @@ impl Terminal {
         self.dirty.store(true, Ordering::Relaxed);
     }
 
-    /// Check and clear dirty flag
+    /// Check and clear dirty flag. Invalidates search/link caches when dirty.
     pub fn take_dirty(&self) -> bool {
-        self.dirty.swap(false, Ordering::Relaxed)
+        let was_dirty = self.dirty.swap(false, Ordering::Relaxed);
+        if was_dirty {
+            *self.cached_links.lock() = None;
+            *self.cached_search.lock() = None;
+        }
+        was_dirty
     }
 
     /// Read-only access to the terminal grid for rendering
@@ -253,6 +262,32 @@ impl Terminal {
             }
             links
         })
+    }
+
+    /// Get links using cache when content hasn't changed.
+    pub fn detect_links_cached(&self) -> Vec<DetectedLink> {
+        if !self.dirty.load(Ordering::Relaxed) {
+            if let Some(ref cached) = *self.cached_links.lock() {
+                return cached.clone();
+            }
+        }
+        let links = self.detect_links();
+        *self.cached_links.lock() = Some(links.clone());
+        links
+    }
+
+    /// Get search results using cache when query and content unchanged.
+    pub fn search_cached(&self, query: &str) -> Vec<SearchMatch> {
+        if !self.dirty.load(Ordering::Relaxed) {
+            if let Some((ref cached_q, ref cached_r)) = *self.cached_search.lock() {
+                if cached_q == query {
+                    return cached_r.clone();
+                }
+            }
+        }
+        let results = self.search(query);
+        *self.cached_search.lock() = Some((query.to_string(), results.clone()));
+        results
     }
 }
 

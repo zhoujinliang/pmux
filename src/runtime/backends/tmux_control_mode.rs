@@ -208,8 +208,10 @@ pub struct TmuxControlModeRuntime {
     session_name: String,
     /// Interior mutability: updated by switch_window() when changing worktrees
     window_name: Mutex<String>,
-    /// PTY master writer — send tmux commands here
+    /// PTY master writer — send tmux commands here (used for non-input commands: resize, split, etc.)
     pty_writer: Arc<Mutex<std::fs::File>>,
+    /// Async input channel — send_input enqueues here; a dedicated writer thread drains and writes
+    input_tx: flume::Sender<(String, Vec<u8>)>,
     /// Per-pane output channels, fed by the parser thread from %output events
     pane_outputs: Arc<Mutex<HashMap<String, flume::Sender<Vec<u8>>>>>,
     /// Cached file handles to pane TTY devices for direct write (bypass send-keys)
@@ -220,6 +222,89 @@ pub struct TmuxControlModeRuntime {
     pty_master_fd: i32,
     /// When true, subscribe_output skips capture_initial_content (caller sends C-l instead)
     skip_next_capture: std::sync::atomic::AtomicBool,
+}
+
+/// Build tmux send-keys commands for the given input bytes.
+/// Pure function — no I/O, no locks.
+fn build_send_keys_commands(pane_id: &str, bytes: &[u8]) -> Vec<String> {
+    let mut commands = Vec::new();
+    if bytes.is_empty() {
+        return commands;
+    }
+    let mut i = 0;
+    while i < bytes.len() {
+        let run_start = i;
+        while i < bytes.len() && bytes[i] >= 0x20 && bytes[i] < 0x7f {
+            i += 1;
+        }
+        if run_start < i {
+            let text = String::from_utf8_lossy(&bytes[run_start..i]);
+            let escaped = text.replace('\'', "'\\''");
+            commands.push(format!("send-keys -l -t {} '{}'", pane_id, escaped));
+        }
+        if i >= bytes.len() {
+            break;
+        }
+
+        if bytes[i] == 0x1b && i + 2 < bytes.len() && bytes[i + 1] == b'[' {
+            let key = match bytes[i + 2] {
+                b'A' => { i += 3; "Up" }
+                b'B' => { i += 3; "Down" }
+                b'C' => { i += 3; "Right" }
+                b'D' => { i += 3; "Left" }
+                b'H' => { i += 3; "Home" }
+                b'F' => { i += 3; "End" }
+                b'1'..=b'9' if i + 3 < bytes.len() && bytes[i + 3] == b'~' => {
+                    let k = match bytes[i + 2] {
+                        b'2' => "IC",
+                        b'3' => "DC",
+                        b'5' => "PPage",
+                        b'6' => "NPage",
+                        _ => { i += 1; "Escape" }
+                    };
+                    if k != "Escape" { i += 4; }
+                    k
+                }
+                _ => { i += 1; "Escape" }
+            };
+            commands.push(format!("send-keys -t {} {}", pane_id, key));
+        } else {
+            match bytes[i] {
+                0x0d | 0x0a => {
+                    commands.push(format!("send-keys -t {} Enter", pane_id));
+                    i += 1;
+                }
+                0x09 => {
+                    commands.push(format!("send-keys -t {} Tab", pane_id));
+                    i += 1;
+                }
+                0x08 | 0x7f => {
+                    commands.push(format!("send-keys -t {} BSpace", pane_id));
+                    i += 1;
+                }
+                0x1b => {
+                    commands.push(format!("send-keys -t {} Escape", pane_id));
+                    i += 1;
+                }
+                b @ 0x01..=0x1a => {
+                    let letter = (b'a' + b - 1) as char;
+                    commands.push(format!("send-keys -t {} C-{}", pane_id, letter));
+                    i += 1;
+                }
+                _ => {
+                    let start = i;
+                    i += 1;
+                    while i < bytes.len() && (bytes[i] & 0xC0) == 0x80 {
+                        i += 1;
+                    }
+                    let text = String::from_utf8_lossy(&bytes[start..i]);
+                    let escaped = text.replace('\'', "'\\''");
+                    commands.push(format!("send-keys -l -t {} '{}'", pane_id, escaped));
+                }
+            }
+        }
+    }
+    commands
 }
 
 /// Open a raw PTY pair with a specific window size. Returns (master_fd, slave_fd).
@@ -392,10 +477,42 @@ impl TmuxControlModeRuntime {
         });
 
         let pty_master_fd_dup = unsafe { libc::dup(master_fd) };
+        let pty_writer = Arc::new(Mutex::new(master_writer));
+
+        // Async input channel + writer thread (like LocalPtyAgent pattern).
+        // send_input enqueues here; the writer thread batches and writes via send-keys.
+        let (input_tx, input_rx) = flume::unbounded::<(String, Vec<u8>)>();
+        let pty_writer_for_input = pty_writer.clone();
+        thread::spawn(move || {
+            loop {
+                let (first_pane, first_bytes) = match input_rx.recv() {
+                    Ok(v) => v,
+                    Err(_) => break,
+                };
+                let mut batch: Vec<(String, Vec<u8>)> = vec![(first_pane, first_bytes)];
+                while let Ok(item) = input_rx.try_recv() {
+                    batch.push(item);
+                }
+                let mut writer = match pty_writer_for_input.lock() {
+                    Ok(w) => w,
+                    Err(_) => break,
+                };
+                for (pane_id, bytes) in &batch {
+                    for cmd in build_send_keys_commands(pane_id, bytes) {
+                        if writeln!(writer, "{}", cmd).is_err() {
+                            return;
+                        }
+                    }
+                }
+                let _ = writer.flush();
+            }
+        });
+
         let rt = Self {
             session_name: session_name.to_string(),
             window_name: Mutex::new(window_name.to_string()),
-            pty_writer: Arc::new(Mutex::new(master_writer)),
+            pty_writer,
+            input_tx,
             pane_outputs,
             pane_tty_writers: Arc::new(Mutex::new(HashMap::new())),
             _control_child: Arc::new(Mutex::new(child)),
@@ -478,85 +595,6 @@ impl TmuxControlModeRuntime {
         Ok(true)
     }
 
-    /// Fallback: send input via tmux send-keys command (slower path).
-    fn send_input_via_send_keys(&self, pane_id: &PaneId, bytes: &[u8]) -> Result<(), RuntimeError> {
-        if bytes.is_empty() {
-            return Ok(());
-        }
-
-        let mut i = 0;
-        while i < bytes.len() {
-            // Collect a run of printable ASCII (0x20..0x7e)
-            let run_start = i;
-            while i < bytes.len() && bytes[i] >= 0x20 && bytes[i] < 0x7f {
-                i += 1;
-            }
-            if run_start < i {
-                let text = String::from_utf8_lossy(&bytes[run_start..i]);
-                let escaped = text.replace('\'', "'\\''");
-                self.send_command(&format!("send-keys -l -t {} '{}'", pane_id, escaped))?;
-            }
-
-            if i >= bytes.len() {
-                break;
-            }
-
-            // Handle non-printable byte(s): escape sequences and control chars
-            if bytes[i] == 0x1b && i + 2 < bytes.len() && bytes[i + 1] == b'[' {
-                let key = match bytes[i + 2] {
-                    b'A' => { i += 3; "Up" }
-                    b'B' => { i += 3; "Down" }
-                    b'C' => { i += 3; "Right" }
-                    b'D' => { i += 3; "Left" }
-                    b'H' => { i += 3; "Home" }
-                    b'F' => { i += 3; "End" }
-                    // CSI sequences with numeric params (e.g. \x1b[3~ = Delete)
-                    b'1'..=b'9' if i + 3 < bytes.len() && bytes[i + 3] == b'~' => {
-                        let k = match bytes[i + 2] {
-                            b'2' => "IC",     // Insert
-                            b'3' => "DC",     // Delete
-                            b'5' => "PPage",  // PageUp
-                            b'6' => "NPage",  // PageDown
-                            _ => { i += 1; "Escape" }
-                        };
-                        if k != "Escape" { i += 4; }
-                        k
-                    }
-                    _ => { i += 1; "Escape" }
-                };
-                self.send_command(&format!("send-keys -t {} {}", pane_id, key))?;
-            } else {
-                let key = match bytes[i] {
-                    0x0d | 0x0a => "Enter",
-                    0x09 => "Tab",
-                    0x08 | 0x7f => "BSpace",
-                    0x1b => "Escape",
-                    b @ 0x01..=0x1a => {
-                        let letter = (b'a' + b - 1) as char;
-                        let cmd = format!("send-keys -t {} C-{}", pane_id, letter);
-                        i += 1;
-                        self.send_command(&cmd)?;
-                        continue;
-                    }
-                    _ => {
-                        // High bytes (UTF-8 multi-byte): collect full codepoint and send literal
-                        let start = i;
-                        i += 1;
-                        while i < bytes.len() && (bytes[i] & 0xC0) == 0x80 {
-                            i += 1;
-                        }
-                        let text = String::from_utf8_lossy(&bytes[start..i]);
-                        let escaped = text.replace('\'', "'\\''");
-                        self.send_command(&format!("send-keys -l -t {} '{}'", pane_id, escaped))?;
-                        continue;
-                    }
-                };
-                self.send_command(&format!("send-keys -t {} {}", pane_id, key))?;
-                i += 1;
-            }
-        }
-        Ok(())
-    }
 }
 
 impl Drop for TmuxControlModeRuntime {
@@ -580,31 +618,10 @@ impl AgentRuntime for TmuxControlModeRuntime {
             return Ok(());
         }
 
-        // #region agent log
-        {
-            use std::sync::atomic::{AtomicU64, Ordering as AtOrd};
-            static INPUT_LOG: AtomicU64 = AtomicU64::new(0);
-            let c = INPUT_LOG.fetch_add(1, AtOrd::Relaxed);
-            if c < 5 {
-                crate::debug_log::dbg_session_log(
-                    "tmux_cc.rs:send_input",
-                    "send_input called",
-                    &serde_json::json!({
-                        "pane_id": pane_id,
-                        "len": bytes.len(),
-                        "bytes_hex": bytes.iter().take(20).map(|b| format!("{:02x}", b)).collect::<Vec<_>>().join(" "),
-                        "path": "send-keys",
-                    }),
-                    "H_input",
-                );
-            }
-        }
-        // #endregion
-
-        // Direct TTY write is broken in tmux CC: writing to the pane's slave
-        // device sends data to the OUTPUT direction (master reads it), not the
-        // shell's INPUT. Always use send-keys which properly injects input.
-        self.send_input_via_send_keys(pane_id, bytes)
+        // Non-blocking: enqueue for the writer thread (never blocks UI thread)
+        self.input_tx
+            .send((pane_id.clone(), bytes.to_vec()))
+            .map_err(|e| RuntimeError::Backend(format!("input channel: {}", e)))
     }
 
     fn send_key(&self, pane_id: &PaneId, key: &str, use_literal: bool) -> Result<(), RuntimeError> {

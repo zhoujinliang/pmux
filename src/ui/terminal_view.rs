@@ -149,7 +149,7 @@ impl RenderOnce for TerminalView {
                 let matches = self
                     .search_query
                     .as_ref()
-                    .map(|q| terminal.search(q))
+                    .map(|q| terminal.search_cached(q))
                     .unwrap_or_default();
                 let search_current = self.search_current_match.and_then(|i| {
                     if i < matches.len() {
@@ -158,7 +158,7 @@ impl RenderOnce for TerminalView {
                         matches.len().checked_sub(1)
                     }
                 });
-                let links = terminal.detect_links();
+                let links = terminal.detect_links_cached();
                 let mut elem = TerminalElement::new(
                     terminal.clone(),
                     focus_handle.clone(),

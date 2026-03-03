@@ -689,7 +689,7 @@ impl AppRoot {
             let term_area_entity = self.terminal_area_entity.clone();
             let mut ext = ContentExtractor::new();
 
-            cx.spawn(async move |entity, cx| {
+            cx.spawn(async move |_entity, cx| {
                 loop {
                     let chunk = match rx.recv_async().await {
                         Ok(c) => c,
@@ -697,6 +697,13 @@ impl AppRoot {
                     };
                     terminal_for_output.process_output(&chunk);
                     ext.feed(&chunk);
+
+                    // Drain all immediately available chunks before notifying UI
+                    while let Ok(next) = rx.try_recv() {
+                        terminal_for_output.process_output(&next);
+                        ext.feed(&next);
+                    }
+
                     let shell_info = ShellPhaseInfo {
                         phase: ext.shell_phase(),
                         last_post_exec_exit_code: None,
@@ -710,7 +717,7 @@ impl AppRoot {
                             &content_str,
                         );
                     }
-                    let _ = entity.update(cx, |_, cx| cx.notify());
+                    // Only notify TerminalAreaEntity (not AppRoot) for terminal content updates
                     if let Some(ref tae) = term_area_entity {
                         let _ = cx.update_entity(tae, |_, cx| cx.notify());
                     }
@@ -795,7 +802,7 @@ impl AppRoot {
             let term_area_entity = self.terminal_area_entity.clone();
             let mut ext = ContentExtractor::new();
 
-            cx.spawn(async move |entity, cx| {
+            cx.spawn(async move |_entity, cx| {
                 loop {
                     let chunk = match rx.recv_async().await {
                         Ok(c) => c,
@@ -803,6 +810,13 @@ impl AppRoot {
                     };
                     terminal_for_output.process_output(&chunk);
                     ext.feed(&chunk);
+
+                    // Drain all immediately available chunks before notifying UI
+                    while let Ok(next) = rx.try_recv() {
+                        terminal_for_output.process_output(&next);
+                        ext.feed(&next);
+                    }
+
                     let shell_info = ShellPhaseInfo {
                         phase: ext.shell_phase(),
                         last_post_exec_exit_code: None,
@@ -816,7 +830,7 @@ impl AppRoot {
                             &content_str,
                         );
                     }
-                    let _ = entity.update(cx, |_, cx| cx.notify());
+                    // Only notify TerminalAreaEntity (not AppRoot) for terminal content updates
                     if let Some(ref tae) = term_area_entity {
                         let _ = cx.update_entity(tae, |_, cx| cx.notify());
                     }
