@@ -12,7 +12,7 @@ use crate::system_notifier;
 use crate::shell_integration::ShellPhaseInfo;
 use crate::terminal::ContentExtractor;
 use crate::runtime::{AgentRuntime, EventBus, RuntimeEvent, StatusPublisher};
-use crate::runtime::backends::{create_runtime_from_env, recover_runtime, resolve_backend, session_name_for_workspace, window_name_for_worktree, window_target};
+use crate::runtime::backends::{create_runtime_from_env, kill_tmux_window, list_tmux_windows, recover_runtime, resolve_backend, session_name_for_workspace, window_name_for_worktree, window_target};
 use crate::runtime::{RuntimeState, WorktreeState};
 use crate::ui::{AppState, sidebar::Sidebar, workspace_tabbar::WorkspaceTabBar, terminal_controller::ResizeController, terminal_view::TerminalBuffer, terminal_area_entity::TerminalAreaEntity, notification_panel_entity::NotificationPanelEntity, new_branch_dialog_entity::NewBranchDialogEntity, delete_worktree_dialog_ui::DeleteWorktreeDialogUi, split_pane_container::SplitPaneContainer, diff_overlay::DiffOverlay, status_bar::StatusBar, models::{StatusCountsModel, NotificationPanelModel, NewBranchDialogModel}, topbar_entity::TopBarEntity};
 use crate::split_tree::SplitNode;
@@ -663,11 +663,6 @@ impl AppRoot {
                 Arc::new(move |bytes: &[u8]| {
                     let _ = runtime_for_input.send_input(&pane_for_input, bytes);
                 });
-            let terminal_for_preedit = terminal.clone();
-            let preedit_callback: Arc<dyn Fn(Option<String>) + Send + Sync> =
-                Arc::new(move |text: Option<String>| {
-                    terminal_for_preedit.set_preedit_text(text);
-                });
             if let Ok(mut buffers) = self.terminal_buffers.lock() {
                 buffers.clear();
                 buffers.insert(
@@ -677,7 +672,6 @@ impl AppRoot {
                         focus_handle: focus_handle.clone(),
                         resize_callback: Some(resize_callback),
                         input_callback: Some(input_callback),
-                        preedit_callback: Some(preedit_callback),
                     },
                 );
             }
@@ -818,11 +812,6 @@ impl AppRoot {
                 Arc::new(move |bytes: &[u8]| {
                     let _ = runtime_for_input.send_input(&pane_for_input, bytes);
                 });
-            let terminal_for_preedit = terminal.clone();
-            let preedit_callback: Arc<dyn Fn(Option<String>) + Send + Sync> =
-                Arc::new(move |text: Option<String>| {
-                    terminal_for_preedit.set_preedit_text(text);
-                });
             if let Ok(mut buffers) = self.terminal_buffers.lock() {
                 buffers.insert(
                     pane_target_str.clone(),
@@ -831,7 +820,6 @@ impl AppRoot {
                         focus_handle: focus_handle.clone(),
                         resize_callback: Some(resize_callback),
                         input_callback: Some(input_callback),
-                        preedit_callback: Some(preedit_callback),
                     },
                 );
             }
@@ -1990,6 +1978,29 @@ impl AppRoot {
         }
     }
 
+    /// Tmux window names that have no corresponding worktree (worktree removed externally). Empty when not tmux backend.
+    fn orphan_tmux_windows_for_repo(&self, repo_path: &Path) -> Vec<String> {
+        let backend = self.effective_backend();
+        if backend != "tmux" && backend != "tmux-cc" {
+            return Vec::new();
+        }
+        let all = list_tmux_windows(repo_path);
+        if all.is_empty() {
+            return Vec::new();
+        }
+        let valid: std::collections::HashSet<String> = if self.cached_worktrees_repo.as_deref() == Some(repo_path) {
+            self.cached_worktrees
+                .iter()
+                .map(|wt| window_name_for_worktree(&wt.path, wt.short_branch_name()))
+                .collect()
+        } else {
+            std::collections::HashSet::new()
+        };
+        all.into_iter()
+            .filter(|w| !valid.contains(w))
+            .collect()
+    }
+
     /// Update status_counts from current pane_statuses
     /// Computes aggregate counts for status display
     fn update_status_counts(&mut self) {
@@ -2033,6 +2044,16 @@ impl AppRoot {
 
     /// Handle keyboard events
     fn handle_key_down(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        // Modal: when new branch dialog is open, only Escape closes it; block all other keys
+        if let Some(ref model_entity) = self.new_branch_dialog_model {
+            if model_entity.read(cx).is_open {
+                if event.keystroke.key.as_str() == "escape" {
+                    self.close_new_branch_dialog(cx);
+                }
+                return;
+            }
+        }
+
         // Check for Alt+Cmd+arrows (pane focus switch)
         if event.keystroke.modifiers.platform && event.keystroke.modifiers.alt {
             let pane_count = self.split_tree.pane_count();
@@ -2206,6 +2227,39 @@ impl AppRoot {
             return; // Don't forward Cmd+key to tmux
         }
 
+        // Shift+key scroll shortcuts (no Cmd)
+        if event.keystroke.modifiers.shift && !event.keystroke.modifiers.platform {
+            let scroll_handled = match event.keystroke.key.as_str() {
+                "pageup" | "pagedown" | "home" | "end" => {
+                    if let Ok(buffers) = self.terminal_buffers.lock() {
+                        if let Some(target) = self.active_pane_target.as_ref() {
+                            if let Some(TerminalBuffer::Terminal { terminal, .. }) = buffers.get(target) {
+                                match event.keystroke.key.as_str() {
+                                    "pageup" => {
+                                        let rows = terminal.size().rows;
+                                        terminal.scroll_display((rows as i32).saturating_sub(2));
+                                    }
+                                    "pagedown" => {
+                                        let rows = terminal.size().rows;
+                                        terminal.scroll_display(-((rows as i32).saturating_sub(2)));
+                                    }
+                                    "home" => terminal.scroll_display(i32::MAX / 2),
+                                    "end" => terminal.scroll_to_bottom(),
+                                    _ => {}
+                                }
+                                true
+                            } else { false }
+                        } else { false }
+                    } else { false }
+                }
+                _ => false,
+            };
+            if scroll_handled {
+                cx.notify();
+                return;
+            }
+        }
+
         // Forward all other keys to terminal via Runtime (xterm escape sequences)
         let key_name = event.keystroke.key.clone();
         let modifiers = KeyModifiers {
@@ -2238,6 +2292,13 @@ impl AppRoot {
                 };
 
                 if let Some(bytes) = bytes_opt {
+                    if let Ok(buffers) = self.terminal_buffers.lock() {
+                        if let Some(TerminalBuffer::Terminal { terminal, .. }) = buffers.get(target) {
+                            if terminal.display_offset() > 0 {
+                                terminal.scroll_to_bottom();
+                            }
+                        }
+                    }
                     let send_result = runtime.send_input(target, &bytes);
                     if let Err(e) = send_result {
                         eprintln!("pmux: send_input failed: {}", e);
@@ -2448,6 +2509,7 @@ impl AppRoot {
 
     /// Opens the new branch dialog
     fn open_new_branch_dialog(&mut self, cx: &mut Context<Self>) {
+        self.ensure_entities(cx);
         if let Some(ref model) = self.new_branch_dialog_model {
             let _ = cx.update_entity(model, |m, cx| {
                 m.open();
@@ -2933,6 +2995,8 @@ impl AppRoot {
                 sidebar.select(0);
             }
         }
+        let orphan_windows = self.orphan_tmux_windows_for_repo(&repo_path);
+        sidebar.set_orphan_windows(orphan_windows);
 
         // Set up select callback
         let app_root_entity_for_sidebar = app_root_entity.clone();
@@ -2951,10 +3015,14 @@ impl AppRoot {
             let _ = cx.update_entity(&app_root_entity_for_new_branch, |this: &mut AppRoot, cx| {
                 this.open_new_branch_dialog(cx);
             });
+            // Double on_next_frame so dialog DOM (and focusable input) is fully mounted before focus
             if let Some(ref focus) = dialog_focus {
                 let focus = focus.clone();
-                window.on_next_frame(move |window, cx| {
-                    window.focus(&focus, cx);
+                window.on_next_frame(move |window, _cx| {
+                    let focus = focus.clone();
+                    window.on_next_frame(move |window, cx| {
+                        window.focus(&focus, cx);
+                    });
                 });
             }
         });
@@ -2963,7 +3031,9 @@ impl AppRoot {
         let app_root_entity_for_view_diff = app_root_entity.clone();
         let app_root_entity_for_right_click = app_root_entity.clone();
         let app_root_entity_for_clear_menu = app_root_entity.clone();
+        let app_root_entity_for_close_orphan = app_root_entity.clone();
         let repo_path_for_delete = repo_path.clone();
+        let repo_path_for_close_orphan = repo_path.clone();
         sidebar.on_delete(move |idx, _window, cx| {
             let _ = cx.update_entity(&app_root_entity_for_delete, |this: &mut AppRoot, cx| {
                 this.sidebar_context_menu_index = None;
@@ -2971,6 +3041,13 @@ impl AppRoot {
                 if let Some(wt) = this.cached_worktrees.get(idx) {
                     this.show_delete_dialog(wt.clone(), cx);
                 }
+            });
+        });
+        sidebar.on_close_orphan(move |window_name, _window, cx: &mut App| {
+            let _ = cx.update_entity(&app_root_entity_for_close_orphan, |this: &mut AppRoot, cx| {
+                let _ = kill_tmux_window(&repo_path_for_close_orphan, window_name);
+                this.refresh_sidebar(cx);
+                cx.notify();
             });
         });
         sidebar.on_view_diff(move |idx, _window, cx| {
@@ -3265,42 +3342,10 @@ impl Render for AppRoot {
             self.settings_secrets_draft = Secrets::load().ok();
         }
 
-        // Resize runtime panes via ResizeController (debounced). gpui-terminal uses with_resize_callback.
-        // Bug3 fix: Only schedule resize when buffer_count > 0. After stop_current_session, buffers
-        // are cleared and setup_local_terminal inserts new buffers async. If we schedule with empty
-        // buffers, on_next_frame resizes 0 engines. Skip until buffers exist.
-        if self.has_workspaces() && !self.resize_controller.is_pending() {
-            let buffer_count = self.terminal_buffers.lock().map(|b| b.len()).unwrap_or(0);
-            if buffer_count > 0 {
-                let bounds = window.window_bounds().get_bounds();
-                let w = f32::from(bounds.size.width);
-                let h = f32::from(bounds.size.height);
-                let sidebar_w = if self.sidebar_visible { self.sidebar_width as f32 } else { 0. };
-                let (cols, rows) = ResizeController::compute_dims_from_bounds(
-                    w, h, self.sidebar_visible, sidebar_w,
-                );
-                let resize_result = self.resize_controller.maybe_resize(cols, rows);
-                if let Some((cols, rows)) = resize_result {
-                    self.resize_controller.set_pending(true);
-                    let pane_targets: Vec<String> =
-                        self.split_tree.flatten().into_iter().map(|(t, _)| t).collect();
-                    let runtime = self.runtime.clone();
-                    let entity = cx.entity();
-                    window.on_next_frame(move |_window, cx| {
-                        if let Some(ref rt) = runtime {
-                            for pane_target in &pane_targets {
-                                let _ = rt.resize(pane_target, cols, rows);
-                            }
-                        }
-                        // Terminal: resize handled via with_resize_callback in TerminalElement
-                        let _ = entity.update(cx, |this, cx| {
-                            this.resize_controller.set_pending(false);
-                            cx.notify();
-                        });
-                    });
-                }
-            }
-        }
+        // Terminal resize is driven entirely by TerminalElement's with_resize_callback,
+        // which uses actual font-measured cell dimensions. Do NOT call runtime.resize()
+        // from window bounds with hardcoded char sizes — that causes dimension mismatch
+        // (e.g. programs draw 120-col lines but only 114 fit, causing line wrapping).
 
         // Cursor: Zed style - always visible, no blink
         let terminal_focus = self.terminal_focus.get_or_insert_with(|| cx.focus_handle()).clone();
@@ -3330,17 +3375,24 @@ impl Render for AppRoot {
         }
 
         let cursor_blink_visible = true; // Zed: cursor always visible, no blink
+        let new_branch_dialog_open = self
+            .new_branch_dialog_model
+            .as_ref()
+            .map_or(false, |e| e.read(cx).is_open);
         div()
             .id("app-root")
+            .relative()
             .size_full()
             .bg(rgb(0x1e1e1e))
             .text_color(rgb(0xcccccc))
             .font_family(".SystemUIFont")
             .focusable()
             .track_focus(&terminal_focus)
-            .on_key_down(cx.listener(|this, event, window, cx| {
-                this.handle_key_down(event, window, cx);
-            }))
+            .when(!new_branch_dialog_open, |el| {
+                el.on_key_down(cx.listener(|this, event, window, cx| {
+                    this.handle_key_down(event, window, cx);
+                }))
+            })
             .child(
                 if let Some(ref deps) = self.dependency_check {
                     self.render_dependency_check_page(deps, cx).into_any_element()
