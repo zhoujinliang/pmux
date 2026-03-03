@@ -73,6 +73,7 @@ pub struct Terminal {
     pty_write_tx: flume::Sender<Vec<u8>>,
     cached_links: Mutex<Option<Vec<DetectedLink>>>,
     cached_search: Mutex<Option<(String, Vec<SearchMatch>)>>,
+    scroll_pixel_remainder: Mutex<f32>,
 }
 
 impl Terminal {
@@ -102,6 +103,7 @@ impl Terminal {
             pty_write_tx,
             cached_links: Mutex::new(None),
             cached_search: Mutex::new(None),
+            scroll_pixel_remainder: Mutex::new(0.0),
         }
     }
 
@@ -296,14 +298,34 @@ impl Terminal {
 
 impl Terminal {
     pub fn scroll_display(&self, delta: i32) {
+        if delta == 0 {
+            return;
+        }
         let mut term = self.term.lock();
         term.scroll_display(Scroll::Delta(delta));
         self.dirty.store(true, Ordering::Relaxed);
     }
 
+    /// Accumulate pixel scroll delta and return the whole-line delta to apply.
+    /// Keeps sub-line remainder for next call, ensuring smooth trackpad scrolling.
+    pub fn scroll_display_pixels(&self, pixels: f32, line_height: f32) -> i32 {
+        if line_height <= 0.0 {
+            return 0;
+        }
+        let mut remainder = self.scroll_pixel_remainder.lock();
+        *remainder += pixels;
+        let lines = (*remainder / line_height) as i32;
+        if lines != 0 {
+            *remainder -= lines as f32 * line_height;
+            self.scroll_display(lines);
+        }
+        lines
+    }
+
     pub fn scroll_to_bottom(&self) {
         let mut term = self.term.lock();
         term.scroll_display(Scroll::Bottom);
+        *self.scroll_pixel_remainder.lock() = 0.0;
         self.dirty.store(true, Ordering::Relaxed);
     }
 

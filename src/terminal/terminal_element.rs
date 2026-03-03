@@ -569,23 +569,23 @@ impl Element for TerminalElement {
             let rows = state.rows;
             let b = bounds;
 
-            window.on_mouse_event(move |event: &ScrollWheelEvent, phase, _window, _cx| {
+            window.on_mouse_event(move |event: &ScrollWheelEvent, phase, window, _cx| {
                 if !phase.bubble() || !b.contains(&event.position) {
                     return;
                 }
                 let mode = terminal.mode();
-                let delta_lines = match event.delta {
-                    ScrollDelta::Lines(d) => -(d.y as i32),
-                    ScrollDelta::Pixels(d) => {
-                        let lh_f: f32 = lh.into();
-                        if lh_f > 0.0 { -(f32::from(d.y) / lh_f) as i32 } else { 0 }
-                    }
-                };
-                if delta_lines == 0 {
-                    return;
-                }
+                let lh_f: f32 = lh.into();
 
                 if is_mouse_mode(mode) {
+                    let delta_lines = match event.delta {
+                        ScrollDelta::Lines(d) => d.y as i32,
+                        ScrollDelta::Pixels(d) => {
+                            if lh_f > 0.0 { (f32::from(d.y) / lh_f) as i32 } else { 0 }
+                        }
+                    };
+                    if delta_lines == 0 {
+                        return;
+                    }
                     if let Some(ref send) = on_input {
                         let display_offset = terminal.display_offset();
                         let (pt, _) = pixel_to_grid(event.position, b.origin, cw, lh, display_offset, cols, rows);
@@ -597,7 +597,18 @@ impl Element for TerminalElement {
                         }
                     }
                 } else {
-                    terminal.scroll_display(delta_lines);
+                    match event.delta {
+                        ScrollDelta::Lines(d) => {
+                            let lines = d.y as i32;
+                            if lines != 0 {
+                                terminal.scroll_display(lines);
+                            }
+                        }
+                        ScrollDelta::Pixels(d) => {
+                            terminal.scroll_display_pixels(f32::from(d.y), lh_f);
+                        }
+                    }
+                    window.refresh();
                 }
             });
         }
@@ -612,7 +623,7 @@ impl Element for TerminalElement {
             let rows = state.rows;
             let b = bounds;
 
-            window.on_mouse_event(move |event: &MouseDownEvent, phase, _window, _cx| {
+            window.on_mouse_event(move |event: &MouseDownEvent, phase, window, _cx| {
                 if !phase.bubble() || event.button != MouseButton::Left || !b.contains(&event.position) {
                     return;
                 }
@@ -634,6 +645,7 @@ impl Element for TerminalElement {
                     };
                     terminal.clear_selection();
                     terminal.start_selection(pt, side, sel_type);
+                    window.refresh();
                 }
             });
         }
@@ -648,7 +660,7 @@ impl Element for TerminalElement {
             let rows = state.rows;
             let b = bounds;
 
-            window.on_mouse_event(move |event: &MouseMoveEvent, phase, _window, _cx| {
+            window.on_mouse_event(move |event: &MouseMoveEvent, phase, window, _cx| {
                 if !phase.bubble() || event.pressed_button != Some(MouseButton::Left) {
                     return;
                 }
@@ -664,6 +676,7 @@ impl Element for TerminalElement {
                     }
                 } else if terminal.has_selection() {
                     terminal.update_selection(pt, side);
+                    window.refresh();
                 }
             });
         }
