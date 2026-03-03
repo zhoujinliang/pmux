@@ -98,8 +98,8 @@ pub fn key_to_bytes(event: &KeyDownEvent, mode: TermMode) -> Option<Vec<u8>> {
         _ => {}
     }
 
-    // Text-producing keystrokes: send key_char bytes directly.
-    // We don't implement InputHandler/IME, so handle text here.
+    // Text-producing keystrokes: let InputHandler handle regular text.
+    // Only send via key_to_bytes if Alt is pressed (ESC prefix needed).
     if let Some(ref ch) = keystroke.key_char {
         if !ch.is_empty() {
             if mods.alt {
@@ -107,7 +107,7 @@ pub fn key_to_bytes(event: &KeyDownEvent, mode: TermMode) -> Option<Vec<u8>> {
                 bytes.extend_from_slice(ch.as_bytes());
                 return Some(bytes);
             }
-            return Some(ch.as_bytes().to_vec());
+            return None;
         }
     }
 

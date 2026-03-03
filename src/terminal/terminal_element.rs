@@ -12,11 +12,10 @@ use std::sync::Arc;
 
 pub struct TerminalElement {
     terminal: Arc<Terminal>,
-    /// Kept for future click-to-focus; focus is currently managed at AppRoot level.
-    #[allow(dead_code)]
     focus_handle: FocusHandle,
     palette: ColorPalette,
     on_resize: Option<Box<dyn Fn(u16, u16) + Send + Sync>>,
+    on_input: Option<Arc<dyn Fn(&[u8]) + Send + Sync>>,
     style: StyleRefinement,
     search_matches: Vec<SearchMatch>,
     search_current: Option<usize>,
@@ -32,6 +31,7 @@ impl TerminalElement {
             focus_handle,
             palette,
             on_resize: None,
+            on_input: None,
             style: StyleRefinement::default(),
             search_matches: Vec::new(),
             search_current: None,
@@ -55,6 +55,11 @@ impl TerminalElement {
     pub fn with_links(mut self, links: Vec<DetectedLink>, hovered: Option<usize>) -> Self {
         self.links = links;
         self.hovered_link = hovered;
+        self
+    }
+
+    pub fn with_input_handler(mut self, f: Arc<dyn Fn(&[u8]) + Send + Sync>) -> Self {
+        self.on_input = Some(f);
         self
     }
 
@@ -447,6 +452,14 @@ impl Element for TerminalElement {
                 transparent_black(),
                 Default::default(),
             ));
+        }
+
+        // Register InputHandler for text input (IME path)
+        if self.focused {
+            if let Some(ref send_fn) = self.on_input {
+                let handler = crate::terminal::terminal_input_handler::TerminalInputHandler::new(send_fn.clone());
+                window.handle_input(&self.focus_handle, handler, cx);
+            }
         }
     }
 }

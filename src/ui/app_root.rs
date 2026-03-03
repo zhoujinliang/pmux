@@ -657,6 +657,12 @@ impl AppRoot {
             }
 
             let focus_handle = self.terminal_focus.get_or_insert_with(|| cx.focus_handle()).clone();
+            let runtime_for_input = runtime.clone();
+            let pane_for_input = pane_target_str.clone();
+            let input_callback: Arc<dyn Fn(&[u8]) + Send + Sync> =
+                Arc::new(move |bytes: &[u8]| {
+                    let _ = runtime_for_input.send_input(&pane_for_input, bytes);
+                });
             if let Ok(mut buffers) = self.terminal_buffers.lock() {
                 buffers.clear();
                 buffers.insert(
@@ -665,6 +671,7 @@ impl AppRoot {
                         terminal: terminal.clone(),
                         focus_handle: focus_handle.clone(),
                         resize_callback: Some(resize_callback),
+                        input_callback: Some(input_callback),
                     },
                 );
             }
@@ -690,6 +697,11 @@ impl AppRoot {
             let mut ext = ContentExtractor::new();
 
             cx.spawn(async move |_entity, cx| {
+                use std::time::{Duration, Instant};
+                let mut last_status_check = Instant::now();
+                let mut last_phase = ext.shell_phase();
+                let status_interval = Duration::from_millis(200);
+
                 loop {
                     let chunk = match rx.recv_async().await {
                         Ok(c) => c,
@@ -704,18 +716,25 @@ impl AppRoot {
                         ext.feed(&next);
                     }
 
-                    let shell_info = ShellPhaseInfo {
-                        phase: ext.shell_phase(),
-                        last_post_exec_exit_code: None,
-                    };
-                    let content_str = ext.take_content().0;
-                    if let Some(ref pub_) = status_publisher {
-                        let _ = pub_.check_status(
-                            &pane_target_clone,
-                            crate::status_detector::ProcessStatus::Running,
-                            Some(shell_info),
-                            &content_str,
-                        );
+                    // Throttle status detection: only run on phase change or every 200ms
+                    let now = Instant::now();
+                    let phase = ext.shell_phase();
+                    if phase != last_phase || now.duration_since(last_status_check) >= status_interval {
+                        last_status_check = now;
+                        last_phase = phase;
+                        let shell_info = ShellPhaseInfo {
+                            phase,
+                            last_post_exec_exit_code: None,
+                        };
+                        let content_str = ext.take_content().0;
+                        if let Some(ref pub_) = status_publisher {
+                            let _ = pub_.check_status(
+                                &pane_target_clone,
+                                crate::status_detector::ProcessStatus::Running,
+                                Some(shell_info),
+                                &content_str,
+                            );
+                        }
                     }
                     // Only notify TerminalAreaEntity (not AppRoot) for terminal content updates
                     if let Some(ref tae) = term_area_entity {
@@ -785,6 +804,12 @@ impl AppRoot {
             }
 
             let focus_handle = self.terminal_focus.get_or_insert_with(|| cx.focus_handle()).clone();
+            let runtime_for_input = runtime.clone();
+            let pane_for_input = pane_target_str.clone();
+            let input_callback: Arc<dyn Fn(&[u8]) + Send + Sync> =
+                Arc::new(move |bytes: &[u8]| {
+                    let _ = runtime_for_input.send_input(&pane_for_input, bytes);
+                });
             if let Ok(mut buffers) = self.terminal_buffers.lock() {
                 buffers.insert(
                     pane_target_str.clone(),
@@ -792,6 +817,7 @@ impl AppRoot {
                         terminal: terminal.clone(),
                         focus_handle: focus_handle.clone(),
                         resize_callback: Some(resize_callback),
+                        input_callback: Some(input_callback),
                     },
                 );
             }
@@ -803,6 +829,11 @@ impl AppRoot {
             let mut ext = ContentExtractor::new();
 
             cx.spawn(async move |_entity, cx| {
+                use std::time::{Duration, Instant};
+                let mut last_status_check = Instant::now();
+                let mut last_phase = ext.shell_phase();
+                let status_interval = Duration::from_millis(200);
+
                 loop {
                     let chunk = match rx.recv_async().await {
                         Ok(c) => c,
@@ -817,18 +848,25 @@ impl AppRoot {
                         ext.feed(&next);
                     }
 
-                    let shell_info = ShellPhaseInfo {
-                        phase: ext.shell_phase(),
-                        last_post_exec_exit_code: None,
-                    };
-                    let content_str = ext.take_content().0;
-                    if let Some(ref pub_) = status_publisher {
-                        let _ = pub_.check_status(
-                            &pane_target_clone,
-                            crate::status_detector::ProcessStatus::Running,
-                            Some(shell_info),
-                            &content_str,
-                        );
+                    // Throttle status detection: only run on phase change or every 200ms
+                    let now = Instant::now();
+                    let phase = ext.shell_phase();
+                    if phase != last_phase || now.duration_since(last_status_check) >= status_interval {
+                        last_status_check = now;
+                        last_phase = phase;
+                        let shell_info = ShellPhaseInfo {
+                            phase,
+                            last_post_exec_exit_code: None,
+                        };
+                        let content_str = ext.take_content().0;
+                        if let Some(ref pub_) = status_publisher {
+                            let _ = pub_.check_status(
+                                &pane_target_clone,
+                                crate::status_detector::ProcessStatus::Running,
+                                Some(shell_info),
+                                &content_str,
+                            );
+                        }
                     }
                     // Only notify TerminalAreaEntity (not AppRoot) for terminal content updates
                     if let Some(ref tae) = term_area_entity {

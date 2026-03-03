@@ -16,6 +16,7 @@ pub enum TerminalBuffer {
         terminal: Arc<crate::terminal::Terminal>,
         focus_handle: gpui::FocusHandle,
         resize_callback: Option<Arc<dyn Fn(u16, u16) + Send + Sync>>,
+        input_callback: Option<Arc<dyn Fn(&[u8]) + Send + Sync>>,
     },
 }
 
@@ -143,7 +144,7 @@ impl IntoElement for TerminalView {
 impl RenderOnce for TerminalView {
     fn render(self, _window: &mut Window, _cx: &mut App) -> impl IntoElement {
         let content_elem: AnyElement = match &self.buffer {
-            TerminalBuffer::Terminal { terminal, focus_handle, resize_callback } => {
+            TerminalBuffer::Terminal { terminal, focus_handle, resize_callback, input_callback } => {
                 use crate::terminal::terminal_element::TerminalElement;
                 use crate::terminal::ColorPalette;
                 let matches = self
@@ -170,6 +171,9 @@ impl RenderOnce for TerminalView {
                 if let Some(cb) = resize_callback {
                     let cb = cb.clone();
                     elem = elem.with_resize_callback(move |cols, rows| cb(cols, rows));
+                }
+                if let Some(cb) = input_callback {
+                    elem = elem.with_input_handler(cb.clone());
                 }
                 elem.size_full().into_any_element()
             }
