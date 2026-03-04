@@ -706,6 +706,7 @@ impl AppRoot {
             cx.spawn(async move |_entity, cx| {
                 use std::time::{Duration, Instant};
                 let mut last_status_check = Instant::now();
+                let mut last_notify = Instant::now();
                 let mut last_phase = ext.shell_phase();
                 let status_interval = Duration::from_millis(200);
                 loop {
@@ -761,7 +762,11 @@ impl AppRoot {
                     if modal_open.load(Ordering::Relaxed) {
                         // continue without notifying; terminal will refresh on next output after modal closes
                     } else if let Some(ref tae) = term_area_entity {
-                        let _ = cx.update_entity(tae, |_, cx| cx.notify());
+                        let now = Instant::now();
+                        if now.duration_since(last_notify) >= Duration::from_millis(16) {
+                            last_notify = now;
+                            let _ = cx.update_entity(tae, |_, cx| cx.notify());
+                        }
                     }
                 }
             })
@@ -858,6 +863,7 @@ impl AppRoot {
             cx.spawn(async move |_entity, cx| {
                 use std::time::{Duration, Instant};
                 let mut last_status_check = Instant::now();
+                let mut last_notify = Instant::now();
                 let mut last_phase = ext.shell_phase();
                 let status_interval = Duration::from_millis(200);
                 loop {
@@ -909,7 +915,11 @@ impl AppRoot {
                     if modal_open.load(Ordering::Relaxed) {
                         // skip terminal notify while modal open (e.g. new branch dialog)
                     } else if let Some(ref tae) = term_area_entity {
-                        let _ = cx.update_entity(tae, |_, cx| cx.notify());
+                        let now = Instant::now();
+                        if now.duration_since(last_notify) >= Duration::from_millis(16) {
+                            last_notify = now;
+                            let _ = cx.update_entity(tae, |_, cx| cx.notify());
+                        }
                     }
                 }
             })
