@@ -222,6 +222,39 @@ impl StatusCounts {
         counts
     }
 
+    /// Compute StatusCounts treating each worktree as one entry (highest-priority pane wins).
+    ///
+    /// Groups pane_ids by worktree prefix (the part before any `:suffix` after the path),
+    /// then picks the highest-priority status per group. This matches what Sidebar displays.
+    ///
+    /// Pane ID format: `"local:{path}"` (primary) or `"local:{path}:{suffix}"` (splits).
+    /// Worktree prefix = `"local:{path}"`.
+    pub fn from_pane_statuses_per_worktree(
+        statuses: &std::collections::HashMap<String, AgentStatus>,
+    ) -> Self {
+        use std::collections::HashSet;
+
+        // Extract unique worktree prefixes.
+        // "local:/some/path" → prefix = "local:/some/path"
+        // "local:/some/path:split-0" → prefix = "local:/some/path"
+        // Split on ':' into at most 3 parts: ["local", "/some/path", "split-0"]
+        let prefixes: HashSet<String> = statuses.keys().map(|k| {
+            let parts: Vec<&str> = k.splitn(3, ':').collect();
+            if parts.len() >= 2 {
+                format!("{}:{}", parts[0], parts[1])
+            } else {
+                k.clone()
+            }
+        }).collect();
+
+        let mut counts = Self::new();
+        for prefix in &prefixes {
+            let status = AgentStatus::highest_priority_for_prefix(statuses, prefix);
+            counts.increment(&status);
+        }
+        counts
+    }
+
     /// Get the most prevalent status
     pub fn most_prevalent(&self) -> Option<AgentStatus> {
         let counts = [
@@ -428,6 +461,25 @@ mod tests {
         // Add error - should take precedence due to priority
         counts.increment(&AgentStatus::Error);
         assert_eq!(counts.most_prevalent(), Some(AgentStatus::Error));
+    }
+
+    #[test]
+    fn test_status_counts_per_worktree_not_per_pane() {
+        use std::collections::HashMap;
+
+        let mut statuses: HashMap<String, AgentStatus> = HashMap::new();
+        // worktree "feat": primary=Idle, split=Error → net status = Error
+        statuses.insert("local:/path/feat".to_string(), AgentStatus::Idle);
+        statuses.insert("local:/path/feat:split-0".to_string(), AgentStatus::Error);
+        // worktree "main": primary=Running, no splits → net status = Running
+        statuses.insert("local:/path/main".to_string(), AgentStatus::Running);
+
+        let counts = StatusCounts::from_pane_statuses_per_worktree(&statuses);
+        // 1 Error (feat) + 1 Running (main); split-0 should NOT be counted separately
+        assert_eq!(counts.error, 1);
+        assert_eq!(counts.running, 1);
+        assert_eq!(counts.idle, 0); // Idle from primary is eclipsed by Error
+        assert_eq!(counts.total(), 2);
     }
 
     #[test]

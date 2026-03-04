@@ -45,14 +45,11 @@ impl StatusCountsModel {
     }
 
     /// Recompute counts from current pane_statuses.
+    /// Counts one status per worktree (highest-priority pane wins), matching Sidebar display.
     pub fn recompute_counts(&mut self) {
-        let mut counts = StatusCounts::new();
         if let Ok(statuses) = self.pane_statuses.lock() {
-            for status in statuses.values() {
-                counts.increment(status);
-            }
+            self.counts = StatusCounts::from_pane_statuses_per_worktree(&statuses);
         }
-        self.counts = counts;
     }
 
     /// Shared pane_statuses ref for Sidebar (per-pane status display).
