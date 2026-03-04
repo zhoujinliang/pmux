@@ -366,6 +366,22 @@ fn open_raw_pty(cols: u16, rows: u16) -> Result<(i32, i32), RuntimeError> {
 }
 
 impl TmuxControlModeRuntime {
+    /// Returns true if tmux's default-shell is zsh. Used to decide whether to pass
+    /// `zsh -o nopromptsp` as the new-session/new-window command (avoids send-keys echo flash).
+    fn is_default_shell_zsh() -> bool {
+        let out = Command::new("tmux")
+            .args(["show", "-g", "default-shell"])
+            .output();
+        match out {
+            Ok(o) if o.status.success() => {
+                let s = String::from_utf8_lossy(&o.stdout);
+                let path = s.trim().to_lowercase();
+                path.ends_with("zsh") || path.contains("/zsh")
+            }
+            _ => false,
+        }
+    }
+
     /// Query the current (active) window name of a session. Used when attaching without specifying a window.
     /// If the tmux command fails with "server exited unexpectedly", removes the stale socket so the next
     /// create path can start a fresh server.
@@ -439,6 +455,9 @@ impl TmuxControlModeRuntime {
                 dir_owned = dir.to_string();
                 create_args.extend(["-c", &dir_owned]);
             }
+            if Self::is_default_shell_zsh() {
+                create_args.extend(["zsh", "-o", "nopromptsp"]);
+            }
             let mut new_sess = Command::new("tmux").args(&create_args).output();
             if let Ok(ref o) = new_sess {
                 if !o.status.success() {
@@ -470,6 +489,9 @@ impl TmuxControlModeRuntime {
                             if let Some(dir) = start_dir.and_then(|p| p.to_str()) {
                                 win_args.extend(["-c", dir]);
                             }
+                            if Self::is_default_shell_zsh() {
+                                win_args.extend(["zsh", "-o", "nopromptsp"]);
+                            }
                             let _ = Command::new("tmux").args(&win_args).output();
                         }
                     }
@@ -481,13 +503,6 @@ impl TmuxControlModeRuntime {
         let _ = Command::new("tmux").args(["set", "-g", "default-terminal", "xterm-256color"]).output();
         let _ = Command::new("tmux").args(["set", "-as", "terminal-features", ",xterm-256color:RGB"]).output();
         let _ = Command::new("tmux").args(["set", "-s", "escape-time", "10"]).output();
-
-        if !skip_create_and_send_keys {
-            let pane_target = format!("{}:{}", session_name, window_name);
-            let _ = Command::new("tmux")
-                .args(["send-keys", "-t", &pane_target, " unsetopt PROMPT_SP 2>/dev/null; clear", "Enter"])
-                .output();
-        }
 
         // Open raw PTY at the target size — tmux reads the PTY winsize to set client dims
         let (master_fd, slave_fd) = open_raw_pty(initial_cols, initial_rows)?;
@@ -1040,14 +1055,11 @@ impl AgentRuntime for TmuxControlModeRuntime {
             if let Some(dir) = start_dir.and_then(|p| p.to_str()) {
                 win_args.extend(["-c".to_string(), dir.to_string()]);
             }
+            if Self::is_default_shell_zsh() {
+                win_args.extend(["zsh".to_string(), "-o".to_string(), "nopromptsp".to_string()]);
+            }
             let args_ref: Vec<&str> = win_args.iter().map(|s| s.as_str()).collect();
             let _ = Command::new("tmux").args(&args_ref).output();
-
-            // Disable PROMPT_SP in the new window's shell (same reason as in new())
-            let pane_target = format!("{}:{}", self.session_name, window_name);
-            let _ = Command::new("tmux")
-                .args(["send-keys", "-t", &pane_target, " unsetopt PROMPT_SP 2>/dev/null; clear", "Enter"])
-                .output();
         }
 
         // Update window_name BEFORE any pane queries so list_panes targets the
