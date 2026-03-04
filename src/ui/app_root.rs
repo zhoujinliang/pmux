@@ -2412,9 +2412,13 @@ impl AppRoot {
             .unwrap_or_else(|| PathBuf::from("."));
 
         self.refresh_worktrees_for_repo(&repo_path);
-        let worktrees = &self.cached_worktrees;
-
         let idx = worktree_idx.unwrap_or(0);
+        self.open_diff_view_for_worktree_with_cache(idx, cx);
+    }
+
+    /// Opens diff view using cached worktrees (no refresh). Call after cache is populated.
+    fn open_diff_view_for_worktree_with_cache(&mut self, idx: usize, cx: &mut Context<Self>) {
+        let worktrees = &self.cached_worktrees;
         let worktree = match worktrees.get(idx) {
             Some(w) => w,
             None => return,
@@ -3160,6 +3164,7 @@ impl AppRoot {
         let app_root_entity_for_close_orphan = app_root_entity.clone();
         let repo_path_for_delete = repo_path.clone();
         let repo_path_for_close_orphan = repo_path.clone();
+        let repo_path_for_view_diff = repo_path.clone();
         sidebar.on_delete(move |idx, _window, cx| {
             let _ = cx.update_entity(&app_root_entity_for_delete, |this: &mut AppRoot, cx| {
                 this.sidebar_context_menu_index = None;
@@ -3199,8 +3204,22 @@ impl AppRoot {
         sidebar.on_view_diff(move |idx, _window, cx| {
             let _ = cx.update_entity(&app_root_entity_for_view_diff, |this: &mut AppRoot, cx| {
                 this.sidebar_context_menu_index = None;
-                this.open_diff_view_for_worktree(Some(idx), cx);
+                cx.notify();
             });
+            let entity = app_root_entity_for_view_diff.clone();
+            let repo_path = repo_path_for_view_diff.clone();
+            cx.spawn(async move |cx| {
+                let result = blocking::unblock(move || {
+                    crate::worktree::discover_worktrees(&repo_path).ok().map(|wt| (wt, repo_path))
+                }).await;
+                let _ = cx.update_entity(&entity, |this: &mut AppRoot, cx: &mut _| {
+                    if let Some((wt, repo_path)) = result {
+                        this.cached_worktrees = wt;
+                        this.cached_worktrees_repo = Some(repo_path);
+                    }
+                    this.open_diff_view_for_worktree_with_cache(idx, cx);
+                });
+            }).detach();
         });
         sidebar.on_right_click(move |idx, _window, cx| {
             let _ = cx.update_entity(&app_root_entity_for_right_click, |this: &mut AppRoot, cx| {
