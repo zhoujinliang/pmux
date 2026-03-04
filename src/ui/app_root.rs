@@ -1632,7 +1632,7 @@ impl AppRoot {
                 None => return,
             };
             let repo_path = tab.path.clone();
-            self.refresh_worktrees_for_repo(&repo_path);
+            // Use cached worktrees; no sync git in click path
             let worktree = match self.cached_worktrees.get(idx) {
                 Some(w) => w,
                 None => return,
