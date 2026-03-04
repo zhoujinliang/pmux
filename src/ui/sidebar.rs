@@ -2,7 +2,7 @@
 // Event Bus driven: status_change broadcast triggers debounced parent notify (see app_root)
 use gpui::prelude::*;
 use gpui::{px, svg, *};
-use crate::worktree::{WorktreeInfo, get_diff_stats};
+use crate::worktree::WorktreeInfo;
 use crate::agent_status::AgentStatus;
 use crate::new_branch_orchestrator::NewBranchOrchestrator;
 use crate::notification_manager::NotificationManager;
@@ -275,24 +275,6 @@ impl Sidebar {
         }
     }
 
-    fn render_diff_stats(add: u32, del: u32, files: u32, meta_color: Rgba) -> impl IntoElement {
-        let mut row = div().flex().flex_row().items_center().gap(px(4.)).text_size(px(10.));
-        if add == 0 && del == 0 && files == 0 {
-            row = row.child(div().text_color(meta_color).child("—"));
-        } else {
-            if add > 0 {
-                row = row.child(div().text_color(rgb(0x4caf50)).child(format!("+{}", add)));
-            }
-            if del > 0 {
-                row = row.child(div().text_color(rgb(0xf44336)).child(format!("-{}", del)));
-            }
-            if files > 0 {
-                row = row.child(div().text_color(meta_color).child(format!(" · {} File{}", files, if files == 1 { "" } else { "s" })));
-            }
-        }
-        row
-    }
-
     fn render_header(repo_name: &str) -> Div {
         div()
             .flex().flex_row().items_center()
@@ -552,37 +534,13 @@ fn format_elapsed(instant: Instant) -> String {
     let elapsed = instant.elapsed();
     let secs = elapsed.as_secs();
     if secs < 60 {
-        "Now".to_string()
+        "Just now".to_string()
     } else if secs < 3600 {
         format!("{}m", secs / 60)
     } else if secs < 86400 {
         format!("{}h", secs / 3600)
     } else {
         format!("{}d", secs / 86400)
-    }
-}
-
-fn format_diff_stats(add: u32, del: u32, files: u32) -> String {
-    if add == 0 && del == 0 && files == 0 {
-        "—".to_string()
-    } else {
-        let mut parts = Vec::new();
-        if add > 0 {
-            parts.push(format!("+{}", add));
-        }
-        if del > 0 {
-            parts.push(format!("-{}", del));
-        }
-        let change_part = if parts.is_empty() {
-            "—".to_string()
-        } else {
-            parts.join(" ")
-        };
-        if files > 0 {
-            format!("{} · {} File{}", change_part, files, if files == 1 { "" } else { "s" })
-        } else {
-            change_part
-        }
     }
 }
 
@@ -619,41 +577,33 @@ impl RenderOnce for Sidebar {
         let mut rows: Vec<AnyElement> = Vec::new();
         for (idx, item) in worktrees.iter().enumerate() {
             let is_selected = selected == Some(idx);
-            let pane_id = worktree_path_to_pane_id(&item.info.path);
-            let status = pane_statuses.get(&pane_id).copied().unwrap_or(AgentStatus::Unknown);
+            let pane_prefix = worktree_path_to_pane_id(&item.info.path);
+            let status = AgentStatus::highest_priority_for_prefix(&pane_statuses, &pane_prefix);
             let mut item_with_status = item.clone();
             item_with_status.set_status(status);
 
             let status_color = item_with_status.status_color();
             let text_color = if is_selected { rgb(0xffffff) } else { rgb(0xcccccc) };
             let meta_color = if is_selected { rgb(0xbbbbbb) } else { rgb(0x888888) };
-            let path_color = if is_selected { rgb(0xaaaaaa) } else { rgb(0x666666) };
 
             let (last_message, last_time) = notification_manager.as_ref().and_then(|mgr| {
                 mgr.lock().ok().and_then(|m| {
-                    m.by_pane(&pane_id).first().map(|n| {
+                    m.by_pane(&pane_prefix).first().map(|n| {
                         (n.display_message(), format_elapsed(n.timestamp()))
                     })
                 })
             }).unwrap_or_else(|| (item_with_status.status_text().to_string(), "—".to_string()));
-
-            let (add, del, files) = get_diff_stats(&item.info.path).unwrap_or((0, 0, 0));
-            let _diff_str = format_diff_stats(add, del, files);
 
             let inner = div()
                 .flex().flex_col().gap(px(2.))
                 .child(
                     div().flex().flex_row().items_center().gap(px(6.))
                         .child(div().text_size(px(11.)).text_color(status_color).child(item_with_status.status_icon()))
-                        .child(div().flex_1().text_size(px(12.)).font_weight(FontWeight::SEMIBOLD).text_color(text_color).child(SharedString::from(item_with_status.formatted_branch())))
-                )
-                .child(div().pl(px(17.)).text_size(px(10.)).text_color(meta_color).line_height(px(14.)).child(SharedString::from(last_message)))
-                .child(
-                    div().pl(px(17.)).flex().flex_row().items_center().justify_between().gap(px(4.))
-                        .child(Self::render_diff_stats(add, del, files, meta_color))
+                        .child(div().flex_1().text_size(px(12.)).font_weight(FontWeight::SEMIBOLD).text_color(text_color)
+                            .child(SharedString::from(item_with_status.info.short_branch_name().to_string())))
                         .child(div().text_size(px(10.)).text_color(meta_color).flex_shrink_0().child(last_time))
                 )
-                .child(div().pl(px(17.)).text_size(px(10.)).text_color(path_color).font_family(".AppleSystemUIFontMonospaced").child(item.info.display_path()));
+                .child(div().pl(px(17.)).text_size(px(10.)).text_color(meta_color).line_height(px(14.)).child(SharedString::from(last_message)));
 
             let row_content = div()
                 .flex_1()
@@ -928,5 +878,32 @@ mod tests {
         let mut sidebar = Sidebar::new("myproject", PathBuf::from("/tmp/project"));
         sidebar.on_delete(|_idx: usize, _window: &mut Window, _cx: &mut App| {});
         assert!(sidebar.on_delete.is_some());
+    }
+
+    #[test]
+    fn test_sidebar_status_aggregates_split_panes() {
+        use std::collections::HashMap;
+
+        let mut pane_statuses: HashMap<String, AgentStatus> = HashMap::new();
+        // Primary pane is Idle, but split-0 has an Error
+        pane_statuses.insert("local:/tmp/feat".to_string(), AgentStatus::Idle);
+        pane_statuses.insert("local:/tmp/feat:split-0".to_string(), AgentStatus::Error);
+
+        // Verify the helper picks Error over Idle
+        let prefix = worktree_path_to_pane_id(std::path::Path::new("/tmp/feat"));
+        let status = AgentStatus::highest_priority_for_prefix(&pane_statuses, &prefix);
+        assert_eq!(status, AgentStatus::Error);
+    }
+
+    #[test]
+    fn test_sidebar_status_primary_only_when_no_splits() {
+        use std::collections::HashMap;
+
+        let mut pane_statuses: HashMap<String, AgentStatus> = HashMap::new();
+        pane_statuses.insert("local:/tmp/feat".to_string(), AgentStatus::Running);
+
+        let prefix = worktree_path_to_pane_id(std::path::Path::new("/tmp/feat"));
+        let status = AgentStatus::highest_priority_for_prefix(&pane_statuses, &prefix);
+        assert_eq!(status, AgentStatus::Running);
     }
 }
