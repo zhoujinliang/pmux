@@ -92,3 +92,9 @@ temp/
 
 # Claude Code local settings (permissions, user-specific)
 .claude/settings.local.json
+
+# Ganix RAG index (local knowledge base)
+.ganix/
+
+# Logo / design assets (not needed for building the project)
+布丁logo_极简线条.png
